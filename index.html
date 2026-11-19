@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Engine Simulator</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230e1114'/%3E%3Ccircle cx='16' cy='20' r='6' fill='none' stroke='%23ffb000' stroke-width='2'/%3E%3Crect x='12' y='5' width='8' height='7' rx='1' fill='%23d6dde4'/%3E%3Cpath d='M16 12v4' stroke='%23d6dde4' stroke-width='2'/%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <div id="app">
+      <header id="topbar">
+        <div class="brand">ENGINE<span>SIM</span></div>
+        <label class="field">Preset <select id="preset"></select></label>
+        <button id="reset" title="Put every slider back to the selected preset">Reset to preset</button>
+        <span id="preset-blurb" class="muted"></span>
+        <div class="spacer"></div>
+        <div class="seg" role="group" aria-label="Gas colour">
+          <button data-color="pressure" class="on">Pressure</button>
+          <button data-color="temperature">Temperature</button>
+          <button data-color="gas">Fresh / burned</button>
+        </div>
+        <button id="cutaway" class="toggle">Cutaway</button>
+        <button id="exploded" class="toggle">Exploded</button>
+        <button id="about">Model notes</button>
+      </header>
+
+      <main>
+        <section id="left">
+          <div id="stage">
+            <div id="view3d"></div>
+            <div id="legend"><div id="legend-bar"></div><div id="legend-labels"><span></span><span></span><span></span></div></div>
+            <div id="partlabel" hidden><b></b><p></p></div>
+            <div id="hint" class="muted">drag to orbit · scroll to zoom · click a part</div>
+            <div id="timebar">
+              <button id="pause" title="Pause (P)">❚❚</button>
+              <button id="step1" title="Advance one crank degree">+1°</button>
+              <button id="step10" title="Advance ten crank degrees">+10°</button>
+              <input id="speed" type="range" min="-3.3" max="0" step="0.01" value="0" title="Simulation speed" />
+              <span id="speed-label">1× real time</span>
+            </div>
+            <div id="pedal" title="Throttle pedal: drag, or hold Space / W">
+              <div id="pedal-fill"></div>
+              <span>THROTTLE</span>
+            </div>
+            <div id="start">
+              <button id="start-btn">Start engine</button>
+              <p>Sound is synthesised live from the simulation. Nothing runs until audio is allowed.</p>
+            </div>
+          </div>
+
+          <div id="gauges">
+            <canvas id="tach" width="300" height="150"></canvas>
+            <div class="tile"><span class="k">Torque</span><span class="v" id="g-torque">0</span><span class="u">N·m</span></div>
+            <div class="tile"><span class="k">Power</span><span class="v" id="g-power">0</span><span class="u">kW</span></div>
+            <div class="tile"><span class="k">Vol. efficiency</span><span class="v" id="g-ve">0</span><span class="u">%</span></div>
+            <div class="tile"><span class="k">Manifold pressure</span><span class="v" id="g-map">101</span><span class="u">kPa</span></div>
+            <div class="tile"><span class="k">Air flow</span><span class="v" id="g-air">0</span><span class="u">g/s</span></div>
+            <div class="lamps">
+              <span id="lamp-ign" class="lamp">IGN</span>
+              <span id="lamp-start" class="lamp">START</span>
+              <span id="lamp-limit" class="lamp">LIMIT</span>
+            </div>
+            <div class="cyl-pick"><span class="k">Cylinder</span><div id="cyl-chips"></div></div>
+            <div id="status" class="muted"></div>
+          </div>
+
+          <div id="instruments">
+            <figure><figcaption>Output waveform</figcaption><canvas id="c-scope"></canvas></figure>
+            <figure><figcaption>Spectrogram <span>firing harmonics marked</span></figcaption><canvas id="c-spec"></canvas></figure>
+            <figure><figcaption>P–V diagram <button id="pv-log" class="mini">log</button></figcaption><canvas id="c-pv"></canvas></figure>
+            <figure><figcaption>Cylinder pressure vs crank angle</figcaption><canvas id="c-ptheta"></canvas></figure>
+            <figure><figcaption>Tract pressure <span>intake → cylinder → exhaust, brown = burned gas</span></figcaption><canvas id="c-tract"></canvas></figure>
+            <figure><figcaption>Valve lift and timing</figcaption><canvas id="c-valves"></canvas></figure>
+          </div>
+        </section>
+
+        <aside id="controls"></aside>
+      </main>
+    </div>
+
+    <dialog id="about-dialog">
+      <div id="about-body"></div>
+      <form method="dialog"><button>Close</button></form>
+    </dialog>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
