@@ -4,7 +4,7 @@
 import type { EngineAudio } from '../audio/engine-audio';
 import type { TopologyInfo } from '../sim/engine';
 import { P_ATM } from '../sim/gas';
-import { DEG, camLift, valveEvents } from '../sim/kinematics';
+import { CAM_EXPONENTS, DEG, camLift, valveEvents } from '../sim/kinematics';
 import { LAYOUT_KINDS, resolveLayout } from '../sim/layouts';
 import { Params } from '../sim/params';
 import { C, H, SnapshotView, TRACE_BINS } from '../sim/snapshot';
@@ -201,7 +201,8 @@ export class Instruments {
     if (!snap) return pl.text('spectrogram', 6, 12);
     // Firing-frequency harmonics from rpm: k * rpm * cylinders / 120.
     const rpm = snap.h(H.rpm);
-    const fire = (rpm * snap.nCyl) / 120;
+    const two = snap.h(H.strokes) === 2;
+    const fire = (rpm * snap.nCyl) / (two ? 60 : 120);
     if (fire > 2) {
       for (let k = 1; k <= 8; k++) {
         const f = fire * k;
@@ -211,7 +212,7 @@ export class Instruments {
         c.fillRect(w - 10, Math.round(y), 10 + 8, 1);
         if (k <= 4 || k === 8) pl.text(k === 1 ? `f₁ ${f.toFixed(0)}` : `${k}f`, w + 10, y + 3, k === 1 ? AMBER : MUTED);
       }
-      const cyc = rpm / 120;
+      const cyc = rpm / (two ? 60 : 120);
       if (cyc > this.fLo && snap.nCyl > 1) {
         const y = this.fToY(cyc, h);
         c.fillStyle = INTAKE;
@@ -240,7 +241,8 @@ export class Instruments {
     const i = Math.min(this.selected, (snap?.nCyl ?? 1) - 1);
     const tr = audio.traces;
     let pMax = 2e5;
-    for (let b = 0; b < TRACE_BINS; b++) pMax = Math.max(pMax, tr[i * TRACE_BINS + b] || 0);
+    const bins = snap && snap.h(H.strokes) === 2 ? 360 : TRACE_BINS;
+    for (let b = 0; b < bins; b++) pMax = Math.max(pMax, tr[i * TRACE_BINS + b] || 0);
     pMax = niceMax((pMax / 1e5) * 1.05) * 1e5;
     const log = this.pvLog;
     const vMin = g.vc, vMax = g.vc + g.vd;
@@ -262,8 +264,8 @@ export class Instruments {
     c.strokeStyle = cylColor(i);
     c.lineWidth = 1.3;
     c.beginPath();
-    for (let b = 0; b <= TRACE_BINS; b++) {
-      const bb = b % TRACE_BINS;
+    for (let b = 0; b <= bins; b++) {
+      const bb = b % bins;
       const x = X(vol(bb + 0.5)), y = Y(tr[i * TRACE_BINS + bb] || P_ATM);
       b === 0 ? c.moveTo(x, y) : c.lineTo(x, y);
     }
@@ -284,17 +286,18 @@ export class Instruments {
     const c = pl.ctx;
     const padL = 30, padB = 14, padT = 6;
     const W = pl.w - padL - 6, Hh = pl.h - padT - padB;
-    for (let d = 0; d <= 720; d += 180) {
-      const x = padL + (d / 720) * W;
+    const cyc = snap && snap.h(H.strokes) === 2 ? 360 : 720;
+    for (let d = 0; d <= cyc; d += cyc / 4) {
+      const x = padL + (d / cyc) * W;
       pl.vline(x, GRID, padT, padT + Hh);
-      pl.text(`${d}°`, x, pl.h - 3, MUTED, d === 720 ? 'right' : d === 0 ? 'left' : 'center');
+      pl.text(`${d}°`, x, pl.h - 3, MUTED, d === cyc ? 'right' : d === 0 ? 'left' : 'center');
     }
     if (!snap) return pl.text('cylinder pressure vs crank angle', padL + 4, padT + 10);
     const n = snap.nCyl;
-    const layout = resolveLayout(LAYOUT_KINDS[p.layout | 0] ?? 'inline', p.cylinders | 0, p.bankAngle, p.crank | 0, p.firingOrder | 0);
+    const layout = resolveLayout(LAYOUT_KINDS[p.layout | 0] ?? 'inline', p.cylinders | 0, p.bankAngle, p.crank | 0, p.firingOrder | 0, cyc === 360);
     const tr = audio.traces;
     let pMax = 2e5;
-    for (let b = 0; b < n * TRACE_BINS; b++) pMax = Math.max(pMax, tr[b] || 0);
+    for (let i = 0; i < n; i++) for (let b = 0; b < cyc; b++) pMax = Math.max(pMax, tr[i * TRACE_BINS + b] || 0);
     pMax = niceMax((pMax / 1e5) * 1.05) * 1e5;
     pl.text(`${(pMax / 1e5).toFixed(0)} bar`, 2, padT + 9);
     const sel = Math.min(this.selected, n - 1);
@@ -306,10 +309,10 @@ export class Instruments {
         c.lineWidth = i === sel ? 1.5 : 1;
         c.beginPath();
         let prevX = -1;
-        for (let b = 0; b < TRACE_BINS; b++) {
+        for (let b = 0; b < cyc; b++) {
           // plot against the global crank angle so the firing order reads left to right
-          const g = (b + fire) % 720;
-          const x = padL + (g / 720) * W, y = padT + Hh - ((tr[i * TRACE_BINS + b] || 0) / pMax) * Hh;
+          const g = (b + fire) % cyc;
+          const x = padL + (g / cyc) * W, y = padT + Hh - ((tr[i * TRACE_BINS + b] || 0) / pMax) * Hh;
           if (b === 0 || x < prevX) c.moveTo(x, y);
           else c.lineTo(x, y);
           prevX = x;
@@ -318,7 +321,7 @@ export class Instruments {
       }
     }
     c.lineWidth = 1;
-    pl.vline(padL + (snap.h(H.theta) / 720) * W, 'rgba(255,255,255,0.7)', padT, padT + Hh);
+    pl.vline(padL + ((snap.h(H.theta) % cyc) / cyc) * W, 'rgba(255,255,255,0.7)', padT, padT + Hh);
   }
 
   // ------------------------------------------------------- tract pressure
@@ -334,20 +337,21 @@ export class Instruments {
     const find = (pred: (q: TopologyInfo['pipes'][number]) => boolean) => topo.pipes.findIndex(pred);
     const pipeSeg = (k: number, label: string, color: string) => segs.push({ kind: 'pipe', label, width: topo.pipes[k].length, pipe: k, color });
     const volSeg = (v: number, label: string, color: string) => segs.push({ kind: 'vol', label, width: 0.09, vol: v, color });
-    pipeSeg(find((q) => q.kind === 'intake'), 'intake', INTAKE);
-    volSeg(1, 'plenum', INTAKE);
-    pipeSeg(find((q) => q.kind === 'runner' && q.cyl === cyl), 'runner', INTAKE);
-    volSeg(2 + cyl, `cyl ${cyl + 1}`, AMBER);
-    const hk = find((q) => q.kind === 'header' && q.cyl === cyl);
-    pipeSeg(hk, 'header', EXHAUST);
-    let v = topo.pipes[hk].volR;
-    for (let guard = 0; guard < 4 && v > 0; guard++) {
+    // Walk the network from this cylinder's intake mouth to the open air at the far end.
+    const names: Record<string, string> = { intake: 'intake', runner: topo.pipes.some((q) => q.kind === 'transfer') ? 'reed' : 'runner', transfer: 'transfer', header: topo.pipes.some((q) => q.kind === 'transfer') ? 'chamber' : 'header', mid: 'pipe', tail: 'tail' };
+    const volNames: Record<string, string> = { plenum: topo.pipes.some((q) => q.kind === 'transfer') ? 'box' : 'plenum', crankcase: 'crankcase', junction: 'coll.', muffler: 'muffler' };
+    let k = find((q) => q.kind === 'intake' && (q.cyl === cyl || q.cyl < 0));
+    let hot = false;
+    for (let guard = 0; guard < 10 && k >= 0; guard++) {
+      const q = topo.pipes[k];
+      if (q.kind === 'header') hot = true;
+      pipeSeg(k, names[q.kind] ?? q.kind, hot ? EXHAUST : INTAKE);
+      const v = q.volR;
+      if (v <= 0) break;
       const kind = topo.volumes[v].kind;
-      volSeg(v, kind === 'junction' ? 'coll.' : kind, EXHAUST);
-      const next = find((q) => q.volL === v && (q.kind === 'mid' || q.kind === 'tail'));
-      if (next < 0) break;
-      pipeSeg(next, topo.pipes[next].kind === 'mid' ? 'pipe' : 'tail', EXHAUST);
-      v = topo.pipes[next].volR;
+      if (kind === 'cylinder') volSeg(v, `cyl ${cyl + 1}`, AMBER);
+      else volSeg(v, volNames[kind] ?? kind, hot ? EXHAUST : INTAKE);
+      k = find((x) => x.volL === v && (x.cyl < 0 || x.cyl === cyl) && x.kind !== 'intake');
     }
     const total = segs.reduce((s, g) => s + g.width, 0);
     const padL = 30, padB = 22, padT = 6;
@@ -423,7 +427,20 @@ export class Instruments {
     const c = pl.ctx;
     const padL = 6, padB = 14, padT = 16;
     const W = pl.w - padL - 6, Hh = pl.h - padT - padB;
+    if (p.strokes > 0.5) return this.drawPorts(snap, p, padL, padB, padT, W, Hh);
     const ev = valveEvents(p.intakeDuration, p.exhaustDuration, p.lsa, p.camAdvance);
+    // Live variable valvetrain state: phaser advance and which lobes are locked in.
+    const vtc = snap ? snap.h(H.vtc) : 0;
+    const vt = p.vtec | 0, high = !!snap && snap.h(H.vtec) > 0.5;
+    const inHigh = vt === 0 || high, exHigh = vt !== 1 || high;
+    const iDur = inHigh ? p.intakeDuration : Math.min(p.lowIntakeDuration, p.intakeDuration), eDur = exHigh ? p.exhaustDuration : Math.min(p.lowExhaustDuration, p.exhaustDuration);
+    const iLift = inHigh ? p.intakeLift : p.lowIntakeLift, eLift = exHigh ? p.exhaustLift : p.lowExhaustLift;
+    ev.intakeCentre -= vtc;
+    ev.ivo = ev.intakeCentre - iDur / 2;
+    ev.ivc = ev.intakeCentre + iDur / 2;
+    ev.evo = ev.exhaustCentre - eDur / 2;
+    ev.evc = ev.exhaustCentre + eDur / 2;
+    ev.overlap = Math.max(0, ev.evc - ev.ivo);
     const X = (d: number) => padL + (d / 720) * W;
     const maxLift = Math.max(p.intakeLift, p.exhaustLift, 1);
     const Y = (mm: number) => padT + Hh - (mm / maxLift) * Hh * 0.92;
@@ -449,20 +466,27 @@ export class Instruments {
       d === 0 ? c.moveTo(X(d), y) : c.lineTo(X(d), y);
     }
     c.stroke();
-    const curve = (centre: number, dur: number, lift: number, color: string) => {
+    const curve = (centre: number, dur: number, lift: number, color: string, idle = false) => {
       c.strokeStyle = color;
       c.fillStyle = color;
-      c.lineWidth = 1.6;
+      c.lineWidth = idle ? 1 : 1.6;
+      c.globalAlpha = idle ? 0.35 : 1;
+      c.setLineDash(idle ? [3, 3] : []);
       c.beginPath();
       for (let d = 0; d <= 720; d += 2) {
-        const y = Y(camLift(d, centre, dur, lift));
+        const y = Y(camLift(d, centre, dur, lift, CAM_EXPONENTS[p.camProfile | 0] ?? 2));
         d === 0 ? c.moveTo(X(d), y) : c.lineTo(X(d), y);
       }
       c.stroke();
       c.lineWidth = 1;
+      c.globalAlpha = 1;
+      c.setLineDash([]);
     };
-    curve(ev.exhaustCentre, p.exhaustDuration, p.exhaustLift, EXHAUST);
-    curve(ev.intakeCentre, p.intakeDuration, p.intakeLift, INTAKE);
+    // The lobes not in use are drawn dashed.
+    if (vt > 0) curve(ev.intakeCentre, inHigh ? Math.min(p.lowIntakeDuration, p.intakeDuration) : p.intakeDuration, inHigh ? p.lowIntakeLift : p.intakeLift, INTAKE, true);
+    if (vt === 1) curve(ev.exhaustCentre, exHigh ? Math.min(p.lowExhaustDuration, p.exhaustDuration) : p.exhaustDuration, exHigh ? p.lowExhaustLift : p.exhaustLift, EXHAUST, true);
+    curve(ev.exhaustCentre, eDur, eLift, EXHAUST);
+    curve(ev.intakeCentre, iDur, iLift, INTAKE);
     // spark
     const spark = (((720 - p.ignitionAdvance) % 720) + 720) % 720;
     pl.vline(X(spark), AMBER, padT + Hh * 0.55, padT + Hh);
@@ -470,8 +494,8 @@ export class Instruments {
     const f = (v: number) => `${Math.round(v)}°`;
     const tall = Hh > 70;
     pl.text(tall ? `EVO ${f(180 - ev.evo)} BBDC` : `EVO ${f(180 - ev.evo)}`, X(ev.evo) - 4, padT + Hh * 0.72, EXHAUST, 'right');
-    pl.text(tall ? `EVC ${f(ev.evc - 360)} ATDC` : '', X(ev.exhaustCentre), Y(p.exhaustLift) - 4, EXHAUST, 'right');
-    pl.text(tall ? `IVO ${f(360 - ev.ivo)} BTDC` : '', X(ev.intakeCentre), Y(p.intakeLift) - 4, INTAKE, 'left');
+    pl.text(tall ? `EVC ${f(ev.evc - 360)} ATDC` : '', X(ev.exhaustCentre), Y(eLift) - 4, EXHAUST, 'right');
+    pl.text(tall ? `IVO ${f(360 - ev.ivo)} BTDC` : '', X(ev.intakeCentre), Y(iLift) - 4, INTAKE, 'left');
     pl.text(tall ? `IVC ${f(ev.ivc - 540)} ABDC` : `IVC ${f(ev.ivc - 540)}`, X(ev.ivc) + 4, padT + Hh * 0.72, INTAKE, 'left');
     if (snap) {
       const i = Math.min(this.selected, snap.nCyl - 1);
@@ -486,5 +510,67 @@ export class Instruments {
       c.arc(X(a), Y(snap.cyl(i, C.liftEx) * 1e3), 3, 0, 7);
       c.fill();
     }
+  }
+
+  /** Two-stroke: port open heights against crank angle over one revolution. */
+  private drawPorts(snap: SnapshotView | null, p: Params, padL: number, padB: number, padT: number, W: number, Hh: number): void {
+    const pl = this.valves;
+    const c = pl.ctx;
+    const g = this.geom(p);
+    const travel = (deg: number) => {
+      const a = deg * DEG, s = Math.sin(a);
+      return g.r + g.l - (g.r * Math.cos(a) + Math.sqrt(g.l * g.l - g.r * g.r * s * s));
+    };
+    const epo = p.exhaustPortOpen, tpo = Math.max(p.transferPortOpen, epo + 2);
+    const xE = travel(epo), xT = travel(tpo), stroke = 2 * g.r;
+    const X = (d: number) => padL + (d / 360) * W;
+    const Y = (h: number) => padT + Hh - (h / (stroke - xE)) * Hh * 0.9;
+    for (const [d, name] of [[0, 'TDC'], [180, 'BDC'], [360, 'TDC']] as [number, string][]) {
+      pl.vline(X(d), GRID, padT, padT + Hh);
+      pl.text(name, X(d), pl.h - 3, MUTED, d === 0 ? 'left' : d === 360 ? 'right' : 'center');
+    }
+    pl.text('power', X(45), padT - 5, '#55616c', 'center');
+    pl.text('scavenge', X(180), padT - 5, '#55616c', 'center');
+    pl.text('compression', X(315), padT - 5, '#55616c', 'center');
+    // blowdown: exhaust open, transfers still shut
+    c.fillStyle = 'rgba(255,122,60,0.10)';
+    c.fillRect(X(epo), padT, X(tpo) - X(epo), Hh);
+    const curve = (edge: number, color: string) => {
+      c.strokeStyle = color;
+      c.lineWidth = 1.6;
+      c.beginPath();
+      for (let d = 0; d <= 360; d += 2) {
+        const y = Y(Math.max(0, travel(d) - edge));
+        d === 0 ? c.moveTo(X(d), y) : c.lineTo(X(d), y);
+      }
+      c.stroke();
+      c.lineWidth = 1;
+    };
+    curve(xE, EXHAUST);
+    curve(xT, INTAKE);
+    // induction window (piston port or rotary disc)
+    const ind = p.induction | 0;
+    if (ind > 0) {
+      const close = ind === 1 ? p.inductionDuration / 2 : p.inductionClose, open = close - p.inductionDuration;
+      c.fillStyle = 'rgba(76,194,255,0.18)';
+      c.fillRect(X(0), padT + Hh - 6, X(close) - X(0), 6);
+      c.fillRect(X(360 + open), padT + Hh - 6, X(360) - X(360 + open), 6);
+      pl.text('induction', X(360 + open) + 2, padT + Hh - 9, INTAKE);
+    }
+    const spark = 360 - p.ignitionAdvance;
+    pl.vline(X(spark), AMBER, padT + Hh * 0.55, padT + Hh);
+    pl.text('spark', X(spark) - 3, padT + Hh * 0.55 + 9, AMBER, 'right');
+    pl.text(`exhaust opens ${Math.round(epo)}° ATDC`, X(180), Y(stroke - xE) - 3, EXHAUST, 'center');
+    pl.text(`transfer ${Math.round(tpo)}°`, X(180), Y(stroke - xT) + 11, INTAKE, 'center');
+    if (snap) {
+      const i = Math.min(this.selected, snap.nCyl - 1);
+      const a = snap.cyl(i, C.angle);
+      pl.vline(X(a), 'rgba(255,255,255,0.8)', padT, padT + Hh);
+      c.fillStyle = EXHAUST;
+      c.beginPath(); c.arc(X(a), Y(snap.cyl(i, C.liftEx)), 3, 0, 7); c.fill();
+      c.fillStyle = INTAKE;
+      c.beginPath(); c.arc(X(a), Y(snap.cyl(i, C.liftIn)), 3, 0, 7); c.fill();
+    }
+    void padB;
   }
 }

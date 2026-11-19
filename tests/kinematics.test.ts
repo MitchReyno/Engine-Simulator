@@ -93,9 +93,39 @@ describe('layouts and firing orders', () => {
     expect(r('v', 2, 0, 0, 45).intervals.map(Math.round)).toEqual([315, 405]);
     expect(r('inline', 4, 1).intervals.map(Math.round)).toEqual([270, 180, 90, 180]);
   });
+  it('two-strokes fire at every TDC: 180-degree twin and 120-degree triple are even', () => {
+    expect(resolveLayout('inline', 2, 0, 1, 0, true).intervals.map(Math.round)).toEqual([180, 180]);
+    expect(resolveLayout('inline', 3, 0, 0, 0, true).intervals.map(Math.round)).toEqual([120, 120, 120]);
+    expect(resolveLayout('single', 1, 0, 0, 0, true).intervals).toEqual([360]);
+  });
   it('shared-pin 90-degree V6 cannot fire evenly', () => {
     const iv = r('v', 6, 1, 0, 90).intervals.map(Math.round);
     expect(iv.reduce((a, b) => a + b, 0)).toBe(720);
     expect(Math.max(...iv) - Math.min(...iv)).toBeGreaterThanOrEqual(60);
+  });
+});
+
+describe('timing chain path', () => {
+  it('wraps two equal sprockets with the textbook belt length', async () => {
+    const { BeltPath } = await import('../src/view3d/drive');
+    const path = new BeltPath([{ x: 0, y: 0, r: 0.05 }, { x: 0, y: 0.4, r: 0.05 }]);
+    expect(path.total).toBeCloseTo(2 * 0.4 + 2 * Math.PI * 0.05, 9);
+  });
+
+  it('is continuous, stays on the sprockets and travels counter-clockwise', async () => {
+    const { BeltPath } = await import('../src/view3d/drive');
+    const circles = [{ x: 0, y: 0, r: 0.02 }, { x: 0.05, y: 0.35, r: 0.04 }, { x: -0.05, y: 0.35, r: 0.04 }];
+    const path = new BeltPath(circles);
+    const a = { x: 0, y: 0, ang: 0 }, b = { x: 0, y: 0, ang: 0 };
+    const step = path.total / 2000;
+    let area = 0;
+    for (let k = 0; k < 2000; k++) {
+      path.at(k * step, a);
+      path.at((k + 1) * step, b);
+      expect(Math.hypot(b.x - a.x, b.y - a.y)).toBeLessThan(step * 1.001);
+      for (const c of circles) expect(Math.hypot(a.x - c.x, a.y - c.y)).toBeGreaterThan(c.r - 1e-9);
+      area += a.x * b.y - b.x * a.y;
+    }
+    expect(area).toBeGreaterThan(0);
   });
 });

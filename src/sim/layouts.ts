@@ -148,7 +148,7 @@ export function mostEvenFireAngles(tdc: number[]): number[] {
   return best;
 }
 
-export function resolveLayout(kind: LayoutKind, cylinders: number, bankAngle: number, crankIndex: number, orderIndex: number): ResolvedLayout {
+export function resolveLayout(kind: LayoutKind, cylinders: number, bankAngle: number, crankIndex: number, orderIndex: number, twoStroke = false): ResolvedLayout {
   const def = findLayout(kind, cylinders);
   const n = def.cylinders;
   const ci = Math.min(Math.max(0, crankIndex | 0), def.cranks.length - 1);
@@ -156,6 +156,18 @@ export function resolveLayout(kind: LayoutKind, cylinders: number, bankAngle: nu
   const ba = def.kind === 'flat' ? 180 : def.kind === 'v' ? bankAngle : 0;
   const beta = def.bank.map((b) => (b * ba) / 2);
   const tdc = crank.pins.map((a, i) => a - beta[i]);
+
+  if (twoStroke) {
+    // Every cylinder fires at each of its TDCs: the order follows from the crank alone.
+    const t0 = mod(tdc[0], 360);
+    const rel = tdc.map((t) => mod(t - t0, 360));
+    const ord = seq(n).sort((a, b) => rel[a] - rel[b] || a - b);
+    const intervals = ord.map((c, i) => (i + 1 < n ? rel[ord[i + 1]] : 360) - rel[c]);
+    return {
+      def, crank, n, bankAngle: ba, beta, pins: crank.pins.slice(), fire: rel.map((a) => mod(a + t0, 360)), order: ord, intervals,
+      orderLabels: [ord.map((c) => c + 1).join('-')], orderIndex: 0, crankIndex: ci, group: seq(n),
+    };
+  }
 
   const candidates: number[][] = [];
   for (const o of crank.orders) {

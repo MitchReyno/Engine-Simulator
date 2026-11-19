@@ -1,8 +1,8 @@
 // The engine model: cylinders (0D), crank dynamics, valve flow coupling to the
 // 1D gas network, and the radiated-sound output. One step() per audio sample.
 
-import { CP, CV, G1, GasNetwork, P_ATM, RHO_ATM, R_GAS, T_ATM } from './gas';
-import { DEG, ValveEvents, valveEvents } from './kinematics';
+import { B_CRIT, CP, CV, G1, GasNetwork, PSI_STAR, P_ATM, RHO_ATM, R_GAS, T_ATM } from './gas';
+import { CAM_EXPONENTS, DEG, ValveEvents, valveEvents } from './kinematics';
 import { LAYOUT_KINDS, ResolvedLayout, resolveLayout } from './layouts';
 import { HIDDEN_DEFAULTS, PARAM_DEFS, Params } from './params';
 import { C, FLAG_IGNITION, FLAG_LIMITER, FLAG_PAUSED, FLAG_STARTER, H, SNAP_CYL_STRIDE, SNAP_HEADER, TRACE_BINS } from './snapshot';
@@ -13,15 +13,19 @@ const LHV = 44e6;
 const AFR_STOICH = 14.7;
 /** Fraction of fuel energy released as heat in the constant-gamma gas (see README). */
 const COMB_EFF = 0.75;
+/** With temperature-dependent specific heat only real combustion inefficiency is left. */
+const COMB_EFF_REAL = 0.9;
 const T_WALL_CYL = 450;
+const REED_W2 = (2 * Math.PI * 180) ** 2;
+const REED_2ZW = 2 * 0.35 * 2 * Math.PI * 180;
 const C_SOUND = 343;
 /** Pascals at the listener that map to full scale before the soft clipper. */
 const P_REF = 10;
 
-const STRUCTURAL = ['layout', 'cylinders', 'crank', 'firingOrder', 'bankAngle', 'collector', 'cellBudget'];
+const STRUCTURAL = ['strokes', 'chamberSilencer', 'layout', 'cylinders', 'crank', 'firingOrder', 'bankAngle', 'collector', 'cellBudget'];
 const GEOMETRY = [
   'bore', 'stroke', 'rodLength', 'compression', 'throttleBody', 'intakeLength', 'runnerLength', 'runnerDiameter',
-  'plenumVolume', 'headerLength', 'headerDiameter', 'midLength', 'mufflerVolume', 'tailLength', 'tailDiameter',
+  'plenumVolume', 'chamberDiameter', 'crankcaseCR', 'exhaustPortOpen', 'transferPortOpen', 'headerLength', 'headerDiameter', 'midLength', 'mufflerVolume', 'tailLength', 'tailDiameter',
 ];
 
 const SMOOTH_KEYS = PARAM_DEFS.filter((d) => d.kind === 'slider' && d.smooth).map((d) => d.key);
@@ -88,6 +92,15 @@ export class EngineSim {
   private kCurtIn = 0; private kCurtEx = 0; private portIn = 0; private portEx = 0;
   private aRun = 1; private aHead = 1;
   private sparkAngle = 700; private ivcAngle = 600;
+  /** Variable valvetrain: phaser advance (crank deg), lock request, per-cylinder lobe in use. */
+  vtcAdv = 0; vtecOn = false;
+  private hiIn = new Uint8Array(12).fill(1); private hiEx = new Uint8Array(12).fill(1);
+  /** Two-stroke state: cycle length, port edges (piston travel), port widths, crankcase. */
+  two = false; private cyc = 720;
+  private camShape = -1; private camTab = new Float64Array(514);
+  private xEoLow = 0; private xIo = 0; private wInd = 0; private reedW2 = REED_W2; private reed2ZW = REED_2ZW;
+  private xEo = 0; private xTo = 0; private wEx = 0; private wTr = 0; private aTr = 1; private vccMin = 1e-4;
+  private reedX = new Float64Array(12); private reedV = new Float64Array(12);
   private inertia = 0.2; private loadK = 0; private starterT0 = 100;
   private radPipes: number[] = [];
 
@@ -99,6 +112,7 @@ export class EngineSim {
   private qTot = new Float64Array(1);
   private xbPrev = new Float64Array(1);
   private hCoef = new Float64Array(1);
+  private spkCyl = new Float64Array(1);
   readonly liftIn = new Float64Array(12);
   readonly liftEx = new Float64Array(12);
   readonly flash = new Float64Array(12);
@@ -108,6 +122,8 @@ export class EngineSim {
 
   // running state
   private stepCount = 0;
+  private idleW = 1; private idleErr = 0;
+  private thrSm = 0; private thrA = 0.002;
   private iac = 1;
   private iacBase = 0.008;
   private throttlePhi = 0.01;
@@ -121,10 +137,14 @@ export class EngineSim {
   private mInPrev = 0;
   private lpIn = 0; private lpA = 0.7;
   private delayIn = new Float32Array(4096); private delayPos = 0;
-  private dIn = 1; private rIn = 1; private rMech = 1;
+  private dIn = 1; private rMech = 1;
   // one monopole per radiating pipe end
   private srcPrev = new Float64Array(12); private srcLp = new Float64Array(12);
   private srcGain = new Float64Array(12); private srcDelay = new Int32Array(12);
+  private srcGain2 = new Float64Array(12); private srcDelay2 = new Int32Array(12);
+  private gIn = 0; private gIn2 = 0; private dIn2 = 1;
+  /** Hottest header wall, K (for display). */
+  headerWallT = 650;
   private srcBuf = new Float32Array(12 * 4096);
   private hpX = 0; private hpY = 0; private hpR = 0.998;
   private fadeGain = 0; private fadeTarget = 1; private fadeStep = 1e-3;
@@ -145,6 +165,7 @@ export class EngineSim {
     this.lpA = 1 - Math.exp((-2 * Math.PI * 9000) / sampleRate);
     this.hpR = 1 - (2 * Math.PI * 12) / sampleRate;
     this.fadeStep = 1 / (0.02 * sampleRate);
+    this.thrA = 1 - Math.exp(-1 / (0.02 * sampleRate));
     this.tickDecay = Math.exp(-1 / (0.0012 * sampleRate));
     this.bpComb.bandpass(1700, 0.7, sampleRate);
     this.bpTick.bandpass(4200, 2.5, sampleRate);
@@ -162,7 +183,7 @@ export class EngineSim {
   // ---------------------------------------------------------------- build
 
   private resolve(p: Params): ResolvedLayout {
-    return resolveLayout(LAYOUT_KINDS[p.layout | 0] ?? 'inline', p.cylinders | 0, p.bankAngle, p.crank | 0, p.firingOrder | 0);
+    return resolveLayout(LAYOUT_KINDS[p.layout | 0] ?? 'inline', p.cylinders | 0, p.bankAngle, p.crank | 0, p.firingOrder | 0, p.strokes > 0.5);
   }
 
   private derive(): void {
@@ -177,53 +198,106 @@ export class EngineSim {
     this.Vc = Vd / (p.compression - 1);
     this.VdTot = Vd * n;
     this.ev = valveEvents(p.intakeDuration, p.exhaustDuration, p.lsa, p.camAdvance);
-    const dIn = 0.36 * this.bore;
-    const dEx = 0.31 * this.bore;
-    this.kCurtIn = 0.7 * 2 * Math.PI * dIn;
-    this.kCurtEx = 0.7 * 2 * Math.PI * dEx;
-    this.portIn = 0.9 * 2 * 0.25 * Math.PI * dIn * dIn;
-    this.portEx = 0.9 * 2 * 0.25 * Math.PI * dEx * dEx;
+    // Valve count and size, clamped to what fits in the bore.
+    const vpc = p.valvesPerCyl | 0;
+    const nIn = vpc === 0 ? 1 : vpc === 1 ? 2 : 3, nEx = vpc === 0 ? 1 : 2;
+    const dIn = Math.min(p.intakeValveSize * 0.01, nIn === 1 ? 0.52 : nIn === 2 ? 0.4 : 0.33) * this.bore;
+    const dEx = Math.min(p.exhaustValveSize * 0.01, nEx === 1 ? 0.45 : 0.34) * this.bore;
+    this.kCurtIn = 0.7 * nIn * Math.PI * dIn;
+    this.kCurtEx = 0.7 * nEx * Math.PI * dEx;
+    this.portIn = 0.9 * nIn * 0.25 * Math.PI * dIn * dIn;
+    this.portEx = 0.9 * nEx * 0.25 * Math.PI * dEx * dEx;
+    if ((p.camProfile | 0) !== this.camShape) {
+      this.camShape = p.camProfile | 0;
+      const e = CAM_EXPONENTS[this.camShape] ?? 2;
+      for (let i = 0; i <= 512; i++) this.camTab[i] = Math.pow(1 - (i / 512) ** 2, e);
+      this.camTab[513] = 0;
+    }
     this.aRun = 0.25 * Math.PI * (p.runnerDiameter * 1e-3) ** 2;
     this.aHead = 0.25 * Math.PI * (p.headerDiameter * 1e-3) ** 2;
-    this.sparkAngle = mod720(720 - p.ignitionAdvance);
-    this.ivcAngle = mod720(this.ev.ivc);
+    const two = (this.two = p.strokes > 0.5);
+    const cyc = (this.cyc = two ? 360 : 720);
+    this.sparkAngle = (((cyc - p.ignitionAdvance) % cyc) + cyc) % cyc;
+    this.ivcAngle = two ? 360 - p.exhaustPortOpen : mod720(this.ev.ivc);
+    if (two) {
+      const travel = (deg: number) => {
+        const a = deg * DEG, sn = Math.sin(a);
+        return this.r + this.l - (this.r * Math.cos(a) + Math.sqrt(this.l * this.l - this.r * this.r * sn * sn));
+      };
+      // Ports are windows in the liner; the piston crown uncovers them on the way down.
+      this.xEo = travel(p.exhaustPortOpen);
+      this.xTo = travel(Math.max(p.transferPortOpen, p.exhaustPortOpen + 2));
+      this.xEoLow = travel(p.exhaustPortOpen + 8);
+      this.wEx = 0.8 * p.exhaustPortWidth * 0.01 * this.bore;
+      this.wTr = 0.75 * p.transferPortWidth * 0.01 * this.bore;
+      this.xIo = travel(p.inductionDuration / 2);
+      this.wInd = 0.8 * 0.6 * this.bore;
+      const w = 2 * Math.PI * p.reedStiffness;
+      this.reedW2 = w * w;
+      this.reed2ZW = 2 * 0.35 * w;
+      this.aTr = 0.25 * Math.PI * (0.5 * this.bore) ** 2;
+      this.vccMin = Vd / (p.crankcaseCR - 1);
+    }
     const litres = this.VdTot * 1e3;
     this.inertia = p.flywheel + 0.015 * litres;
     this.loadK = ((p.load / 100) * 100 * litres) / (314.16 * 314.16);
     this.starterT0 = 80 * litres + 0.9 * p.compression * P_ATM * this.Ap * this.r;
     // Feed-forward idle air: roughly what the engine needs at ~35 kPa manifold pressure.
     const aTb = 0.25 * Math.PI * (p.throttleBody * 1e-3) ** 2;
-    this.iacBase = (0.35 * RHO_ATM * this.VdTot * (p.idleRpm / 120) * 0.85) / (0.88 * aTb * 234) * 0.45;
-    this.rIn = Math.max(0.3, Math.hypot(p.listenerPos, p.listenerDist));
+    this.iacBase = ((0.35 * RHO_ATM * this.VdTot * (p.idleRpm / (two ? 60 : 120)) * 0.85) / (0.88 * aTb * (two ? n : 1) * 234)) * (two ? 1.1 : 0.45);
+    if (!two) {
+      // A late-closing intake pushes charge back out at idle speed, so it needs more idle air.
+      const durIdle = p.vtec > 0.5 ? Math.min(p.lowIntakeDuration, p.intakeDuration) : p.intakeDuration;
+      const trapped = (ivcDeg: number) => {
+        const a = ivcDeg * DEG, sn = Math.sin(a);
+        return this.Vc + this.Ap * (this.r + this.l - (this.r * Math.cos(a) + Math.sqrt(this.l * this.l - this.r * this.r * sn * sn)));
+      };
+      const k = trapped(593) / trapped(Math.min(700, Math.max(540, this.ev.intakeCentre + durIdle / 2)));
+      this.iacBase *= k * k;
+    }
     this.rMech = Math.hypot(p.listenerPos - 0.6, p.listenerDist);
     this.placeSources();
-    this.dIn = Math.min(4000, (this.rIn / C_SOUND) * this.sampleRate);
   }
 
-  /** Listener geometry: each radiating pipe end is a monopole at its own position. */
+  /**
+   * Listener geometry: each radiating pipe end is a monopole at its own position
+   * and height. With ground reflection, each also has an image source below the ground.
+   */
   private placeSources(): void {
     if (!this.topo) return;
     const p = this.cur;
+    const hl = 1.2;
+    const refl = p.fxGround > 0.5 ? 0.85 : 0;
+    const place = (x: number, y: number, hs: number): [number, number, number, number] => {
+      const d = Math.hypot(p.listenerPos - x, p.listenerDist - y);
+      const r1 = Math.max(0.3, Math.hypot(d, hl - hs)), r2 = Math.hypot(d, hl + hs);
+      const toSamples = (r: number) => Math.min(4000, Math.round((r / C_SOUND) * this.sampleRate));
+      return [1 / (4 * Math.PI * r1), toSamples(r1), refl / (4 * Math.PI * r2), toSamples(r2)];
+    };
     const rad = this.radPipes;
     for (let i = 0; i < rad.length && i < 12; i++) {
       const q = this.topo.pipes[rad[i]];
-      let x = 3.5, y = 0.45;
+      let x = 3.5, y = 0.45, h = 0.3;
       if (q.kind === 'tail') {
         if (rad.length > 1) y = q.group === 0 ? 0.6 : -0.6;
       } else {
         x = 0.9;
+        h = 0.4;
         y = this.layout.def.bank[q.cyl] > 0 ? -0.45 : 0.45;
       }
-      const r = Math.max(0.3, Math.hypot(p.listenerPos - x, p.listenerDist - y));
-      this.srcGain[i] = 1 / (4 * Math.PI * r);
-      this.srcDelay[i] = Math.min(4000, Math.round((r / C_SOUND) * this.sampleRate));
+      [this.srcGain[i], this.srcDelay[i], this.srcGain2[i], this.srcDelay2[i]] = place(x, y, h);
     }
+    [this.gIn, this.dIn, this.gIn2, this.dIn2] = place(0, 0, 0.7);
   }
 
   private cylVolumeAt(i: number): number {
     const a = mod720(this.theta - this.fire[i]) * DEG;
     const sn = Math.sin(a);
     return this.Vc + this.Ap * (this.r + this.l - (this.r * Math.cos(a) + Math.sqrt(this.l * this.l - this.r * this.r * sn * sn)));
+  }
+
+  private ccVolumeAt(i: number): number {
+    return this.vccMin + this.Ap * 2 * this.r - (this.cylVolumeAt(i) - this.Vc);
   }
 
   private rescaleVolume(v: number, vNew: number): void {
@@ -249,6 +323,7 @@ export class EngineSim {
       this.qTot = new Float64Array(n);
       this.xbPrev = new Float64Array(n);
       this.hCoef = new Float64Array(n);
+      this.spkCyl = new Float64Array(n).fill(700);
       this.fire = new Float64Array(n);
       this.trace.fill(P_ATM);
     }
@@ -258,10 +333,16 @@ export class EngineSim {
     const topo = buildTopology(this.cur, this.layout, this.dt);
     const gas = new GasNetwork(
       topo.volumes.map((v) => ({ volume: v.volume, fixed: v.kind === 'ambient' })),
-      topo.pipes.map((q) => ({ length: q.length, diameter: q.diameter, cells: q.cells, volL: q.volL, volR: q.volR, wallT: q.wallT })),
+      topo.pipes.map((q) => ({ length: q.length, diameter: q.diameter, profile: q.profile, cells: q.cells, volL: q.volL, volR: q.volR, wallT: q.wallT })),
     );
     if (old && oldTopo && oldTopo.signature === topo.signature) {
       for (let v = 1; v < gas.nv; v++) gas.setVolumeState(v, old.vp[v], old.vT[v], old.vY[v]);
+      for (let k = 0; k < gas.np; k++) {
+        gas.pTw[k] = old.pTw[k];
+        // carry the end flows over so the radiated-sound derivative sees no step
+        gas.pMdotL[k] = old.pMdotL[k];
+        gas.pMdotR[k] = old.pMdotR[k];
+      }
       for (let k = 0; k < gas.np; k++) {
         const nNew = gas.pN[k], nOld = old.pN[k], o0 = old.pOff[k], o1 = gas.pOff[k];
         for (let i = 0; i < nNew; i++) {
@@ -289,7 +370,8 @@ export class EngineSim {
     this.topoId++;
     for (let i = 0; i < n; i++) {
       this.rescaleVolume(VOL_CYL0 + i, this.cylVolumeAt(i));
-      this.aPrev[i] = mod720(this.theta - this.fire[i]);
+      if (topo.twoStroke) this.rescaleVolume(topo.crankcase[i], this.ccVolumeAt(i));
+      this.aPrev[i] = mod720(this.theta - this.fire[i]) % this.cyc;
       this.traceBin[i] = Math.floor(this.aPrev[i]) % TRACE_BINS;
     }
     this.radPipes = [];
@@ -308,11 +390,14 @@ export class EngineSim {
       return;
     }
     const g = this.gas;
-    for (let k = 0; k < topo.pipes.length; k++) g.setPipeGeometry(k, topo.pipes[k].length, topo.pipes[k].diameter);
+    for (let k = 0; k < topo.pipes.length; k++) g.setPipeGeometry(k, topo.pipes[k].length, topo.pipes[k].diameter, topo.pipes[k].profile);
     for (let v = 1; v < topo.volumes.length; v++) {
-      if (topo.volumes[v].kind !== 'cylinder') this.rescaleVolume(v, topo.volumes[v].volume);
+      if (topo.volumes[v].kind !== 'cylinder' && topo.volumes[v].kind !== 'crankcase') this.rescaleVolume(v, topo.volumes[v].volume);
     }
-    for (let i = 0; i < this.n; i++) this.rescaleVolume(VOL_CYL0 + i, this.cylVolumeAt(i));
+    for (let i = 0; i < this.n; i++) {
+      this.rescaleVolume(VOL_CYL0 + i, this.cylVolumeAt(i));
+      if (topo.twoStroke) this.rescaleVolume(topo.crankcase[i], this.ccVolumeAt(i));
+    }
     this.topo = topo;
   }
 
@@ -337,6 +422,7 @@ export class EngineSim {
       else {
         cur[k] = tgt[k];
         changed = true;
+        if (k === 'fxEnds') geom = true;
       }
     }
     if (structural) {
@@ -360,11 +446,43 @@ export class EngineSim {
     if (geom) this.applyGeometry();
     else if (changed) this.derive();
 
+    this.updateWalls(cur.paused ? 0 : blockSamples * this.dt * cur.timeScale);
+
     const ts = cur.timeScale;
     const audible = ts >= 0.999 ? 1 : Math.min(1, Math.max(0, (ts - 0.08) / 0.2));
     this.fadeTarget = this.pendingStructural || cur.paused ? 0 : audible;
     this.starterOn = cur.starter > 0.5 || this.autoStart;
     if (!Number.isFinite(this.omega) || !Number.isFinite(this.gas.maxRate) || !Number.isFinite(this.gas.vp[VOL_PLENUM]) || !Number.isFinite(this.hpY)) this.recover();
+  }
+
+  /** Lumped wall thermal model per pipe, and the afterfire switches. Once per block. */
+  private updateWalls(dt: number): void {
+    const g = this.gas, cur = this.cur;
+    const thermal = cur.fxWalls > 0.5;
+    const lam = cur.afr / AFR_STOICH;
+    g.reactQ = cur.fxAfterfire > 0.5 ? (LHV / AFR_STOICH) * Math.min(1, 1 / lam) * 0.8 : 0;
+    let hot = 0;
+    for (let k = 0; k < g.np; k++) {
+      const q = this.topo.pipes[k];
+      const exhaust = q.kind === 'header' || q.kind === 'mid' || q.kind === 'tail';
+      g.pReact[k] = exhaust ? 1 : 0;
+      if (!thermal) {
+        g.pTw[k] = q.wallT;
+      } else if (dt > 0) {
+        // Steel tube 1.5 mm for the exhaust, 3 mm aluminium for the intake.
+        const wall = exhaust ? 7800 * 480 * 0.0015 : 2700 * 900 * 0.003;
+        const areaOut = Math.PI * q.diameter * q.length;
+        const Tw = g.pTw[k];
+        const Ta = exhaust ? 320 : 310;
+        const loss = ((exhaust ? 30 : 15) * (Tw - Ta) + (exhaust ? 0.7 : 0.3) * 5.67e-8 * (Tw * Tw * Tw * Tw - Ta * Ta * Ta * Ta)) * areaOut * dt;
+        let next = Tw + (g.pQw[k] - loss) / (wall * areaOut);
+        if (next < 280) next = 280; else if (next > 1400) next = 1400;
+        g.pTw[k] = next;
+      }
+      g.pQw[k] = 0;
+      if (q.kind === 'header' && g.pTw[k] > hot) hot = g.pTw[k];
+    }
+    this.headerWallT = hot;
   }
 
   private recover(): void {
@@ -393,7 +511,7 @@ export class EngineSim {
         if (d < 0) d += 720;
         this.stepDeg -= d > 0 ? d : 0.002;
         for (let i = 0; i < this.radPipes.length; i++) this.srcPrev[i] = this.gas.pMdotR[this.radPipes[i]];
-        this.mInPrev = this.gas.pMdotL[0];
+        this.mInPrev = this.intakeFlow();
       }
       return 0;
     }
@@ -404,6 +522,13 @@ export class EngineSim {
     const cfl = this.gas.maxRate * this.dt * ts * 1.15;
     this.nsub = cfl > 0.9 ? Math.min(8, Math.ceil(cfl / 0.9)) : 1;
     return this.audio(dt * nsub, ts);
+  }
+
+  private intakeFlow(): number {
+    const ip = this.topo.intakePipes;
+    let m = 0;
+    for (let i = 0; i < ip.length; i++) m += this.gas.pMdotL[ip[i]];
+    return m;
   }
 
   private substep(dt: number): void {
@@ -424,17 +549,57 @@ export class EngineSim {
     const sparkOk = cur.ignition > 0.5 && !this.limiterCut && this.omega > 8;
 
     const hUpdate = (this.stepCount & 7) === 0;
-    const ivcA = this.ivcAngle, spkA = this.sparkAngle;
-    const ci = this.ev.intakeCentre, ce = this.ev.exhaustCentre;
-    const durI = cur.intakeDuration, durE = cur.exhaustDuration;
-    const LI = cur.intakeLift * 1e-3, LE = cur.exhaustLift * 1e-3;
+    // Idle spark control: hold some advance in reserve and trade it for torque, as an ECU does.
+    let spkA = this.sparkAngle;
+    if (this.idleW > 0) {
+      let trim = 45 * this.idleErr;
+      if (trim > 12) trim = 12; else if (trim < -12) trim = -12;
+      spkA -= this.idleW * (trim - 8);
+      if (spkA >= this.cyc) spkA -= this.cyc; else if (spkA < 0) spkA += this.cyc;
+    }
+    // Intake cam phaser: an ECU map of speed and manifold pressure, slewed at an oil-limited rate.
+    if (cur.vtc > 0.5 && !this.two) {
+      const fr = rpm < 1000 ? 0 : rpm < 2200 ? (rpm - 1000) / 1200 : rpm < 3800 ? 1 : rpm < 5500 ? 1 - 0.4 * ((rpm - 3800) / 1700) : 0.6;
+      let fl = (g.vp[VOL_PLENUM] - 40e3) / 40e3;
+      if (fl < 0) fl = 0; else if (fl > 1) fl = 1;
+      const want = cur.vtcRange * fr * (0.15 + 0.85 * fl);
+      const maxStep = 150 * dt;
+      const d = want - this.vtcAdv;
+      this.vtcAdv += d > maxStep ? maxStep : d < -maxStep ? -maxStep : d;
+    } else this.vtcAdv = 0;
+    const vtec = this.two ? 0 : cur.vtec | 0;
+    if (vtec > 0) {
+      if (rpm > cur.vtecRpm) this.vtecOn = true;
+      else if (rpm < cur.vtecRpm - 300) this.vtecOn = false;
+    } else this.vtecOn = false;
+    const wantIn = vtec === 0 || this.vtecOn ? 1 : 0, wantEx = vtec !== 1 || this.vtecOn ? 1 : 0;
+    const ci = this.ev.intakeCentre - this.vtcAdv, ce = this.ev.exhaustCentre;
+    const durIH = cur.intakeDuration, durEH = cur.exhaustDuration;
+    const durIL = cur.lowIntakeDuration < durIH ? cur.lowIntakeDuration : durIH, durEL = cur.lowExhaustDuration < durEH ? cur.lowExhaustDuration : durEH;
+    const LIH = cur.intakeLift * 1e-3, LEH = cur.exhaustLift * 1e-3;
+    const LIL = cur.lowIntakeLift * 1e-3, LEL = cur.lowExhaustLift * 1e-3;
+    let ivcA = ci + 0.5 * (wantIn ? durIH : durIL);
+    if (ivcA >= 720) ivcA -= 720;
+    if (this.two) ivcA = this.ivcAngle;
     const topo = this.topo;
     let torque = 0;
     let sumP = 0;
+    const camTab = this.camTab;
+    const two = this.two;
+    // Power valve: the port's top edge sits lower until the engine is revving.
+    let xEo = this.xEo;
+    if (two && cur.powerValve > 0.5) { const w = rpm < 5500 ? 1 : rpm > 7500 ? 0 : (7500 - rpm) / 2000; xEo += w * (this.xEoLow - xEo); }
+    const induction = cur.induction | 0;
+    const bdcMark = two ? 180 : 540;
+    const gasVar = cur.fxGas > 0.5;
+    const blowby = cur.fxBlowby > 0.5 ? 2e-7 * (this.bore / 0.086) : 0;
+    const mRec = cur.fxInertia > 0.5 ? 650 * this.bore * this.bore * this.bore : 0;
+    let jRec = 0, cRec = 0;
 
     for (let i = 0; i < n; i++) {
       let a = th - this.fire[i];
       if (a < 0) a += 720;
+      if (two && a >= 360) a -= 360;
       const ar = a * DEG;
       const sn = Math.sin(ar), cs = Math.cos(ar);
       const root = Math.sqrt(l * l - r * r * sn * sn);
@@ -443,12 +608,18 @@ export class EngineSim {
       const dVdth = Ap * r * sn * (1 + (r * cs) / root);
       const v = VOL_CYL0 + i;
       const V0 = g.vV[v];
-      const k = 0.5 * G1 * (V - V0);
-      let E = (g.vE[v] * (1 - k / V0)) / (1 + k / V);
-      const m = g.vm[v];
+      let m = g.vm[v];
+      const T0 = g.vE[v] / (m * CV);
+      // Specific heat: constant, or rising with temperature. 650 + 0.2 T gives 710 J/kg K at 300 K,
+      // 850 at 1000 K (air) and 1150 at 2500 K (burned gas with dissociation): gamma 1.40 down to 1.25.
+      const cv = gasVar ? 650 + 0.2 * (T0 < 3500 ? T0 : 3500) : CV;
+      const k = (0.5 * R_GAS * (V - V0)) / cv;
+      let T = (T0 * (1 - k / V0)) / (1 + k / V);
       const ap = this.aPrev[i];
 
-      if (dth > 0 && crossed(ap, a, spkA) && sparkOk && !this.burning[i]) {
+      // Latch this cylinder's spark angle at BDC so a moving setpoint can never skip a spark.
+      if (crossed(ap, a, bdcMark)) this.spkCyl[i] = spkA;
+      if (dth > 0 && crossed(ap, a, this.spkCyl[i]) && sparkOk && !this.burning[i]) {
         const mY = g.vmY[v];
         const fresh = m - mY;
         const lam = cur.afr / AFR_STOICH;
@@ -459,7 +630,7 @@ export class EngineSim {
         else if (lam > 1.35) fl = Math.max(0, (1.7 - lam) / 0.35);
         if (resid > 0.5) fl *= Math.max(0, (0.8 - resid) / 0.3);
         if (fl > 0.02 && fresh > 0) {
-          this.qTot[i] = ((LHV * fresh) / AFR_STOICH) * Math.min(1, 1 / lam) * COMB_EFF * fl;
+          this.qTot[i] = ((LHV * fresh) / AFR_STOICH) * Math.min(1, 1 / lam) * (gasVar ? COMB_EFF_REAL : COMB_EFF) * fl;
           this.burnDur[i] = cur.burnDuration * (1 + 2.2 * (lam - 0.9) * (lam - 0.9) + 1.2 * resid);
           this.burnAng[i] = 0;
           this.xbPrev[i] = 0;
@@ -474,7 +645,7 @@ export class EngineSim {
         let xb = xr >= 1 ? 1 : 1 - Math.exp(-5 * xr * xr * xr);
         const xp = this.xbPrev[i];
         const dxb = xb - xp;
-        E += this.qTot[i] * dxb;
+        T += (this.qTot[i] * dxb) / (m * cv);
         g.vmY[v] += (m - g.vmY[v]) * (dxb / (1 - xp + 1e-9));
         this.xbPrev[i] = xb;
         if (xr >= 1) this.burning[i] = 0;
@@ -484,44 +655,123 @@ export class EngineSim {
       this.flash[i] = flash;
 
       // Wall heat loss (Hohenberg correlation, coefficient refreshed every 8 steps).
-      const T = E / (m * CV);
       if (hUpdate) {
-        const p0 = (G1 * E) / V;
+        const p0 = (m * R_GAS * T) / V;
         this.hCoef[i] = 130 * Math.pow(V, -0.06) * Math.pow(p0 * 1e-5, 0.8) * Math.pow(T, -0.4) * Math.pow(this.meanPistonSpeed + 1.4, 0.8);
       }
       let dQ = this.hCoef[i] * (2 * Ap + Math.PI * this.bore * x) * (T - T_WALL_CYL) * dt;
-      if (dQ > 0.2 * E) dQ = 0.2 * E;
-      E -= dQ;
+      let dT = dQ / (m * cv);
+      if (dT > 0.2 * T) dT = 0.2 * T;
+      T -= dT;
 
-      g.vE[v] = E;
+      // Ring blow-by: a small orifice from the cylinder to the crankcase.
+      if (blowby > 0) {
+        const pc = (m * R_GAS * T) / V;
+        if (pc > P_ATM) {
+          const rr = P_ATM / pc;
+          let ef = 1;
+          if (rr > B_CRIT) { const xr = (rr - B_CRIT) / (1 - B_CRIT); ef = Math.sqrt(1 - xr * xr); }
+          let dm = ((blowby * pc * PSI_STAR) / Math.sqrt(R_GAS * T)) * ef * dt;
+          if (dm > 0.05 * m) dm = 0.05 * m;
+          if (two) {
+            const vc = topo.crankcase[i];
+            g.vm[vc] += dm;
+            g.vE[vc] += dm * CP * T;
+            g.vmY[vc] += (dm * g.vmY[v]) / m;
+          }
+          g.vmY[v] *= 1 - dm / m;
+          m -= dm;
+          g.vm[v] = m;
+        }
+      }
+
+      g.vE[v] = m * CV * T;
       g.vV[v] = V;
       g.refreshVolume(v);
       const p = g.vp[v];
-      torque += (p - P_ATM) * dVdth;
+      let pUnder = P_ATM;
+      if (two) {
+        // Crankcase: the underside of the piston is the scavenge pump.
+        const vc = topo.crankcase[i];
+        const Vn = this.vccMin + Ap * (2 * r - x);
+        const Vo = g.vV[vc];
+        const kc = 0.5 * G1 * (Vn - Vo);
+        g.vE[vc] = (g.vE[vc] * (1 - kc / Vo)) / (1 + kc / Vn);
+        g.vV[vc] = Vn;
+        g.refreshVolume(vc);
+        pUnder = g.vp[vc];
+      }
+      torque += (p - pUnder) * dVdth;
+      if (mRec > 0) {
+        // Reciprocating mass: s' and s'' of the piston with respect to crank angle.
+        const s1 = -r * sn - (r * r * sn * cs) / root;
+        const s2 = -r * cs - (r * r * (cs * cs - sn * sn)) / root - (r * r * r * r * sn * sn * cs * cs) / (root * root * root);
+        jRec += mRec * s1 * s1;
+        cRec += mRec * s1 * s2;
+      }
       sumP += p;
 
-      // Valve lift -> effective orifice area ratio at the pipe ends.
-      let d = a - ci;
-      if (d > 360) d -= 720; else if (d < -360) d += 720;
-      let xx = (2 * d) / durI;
-      let lift = 0;
-      if (xx > -1 && xx < 1) { const q = 1 - xx * xx; lift = LI * q * q; }
-      if (lift === 0 && this.liftIn[i] > 0) this.tickEnv += 0.5 + rpm * 2e-4;
-      this.liftIn[i] = lift;
-      let ac = this.kCurtIn * lift;
-      let phi = (ac * this.portIn) / Math.sqrt(ac * ac + this.portIn * this.portIn) / this.aRun;
-      g.pPhiR[topo.runnerPipe[i]] = phi > 1 ? 1 : phi;
+      if (two) {
+        // Piston-controlled ports: open height is how far the crown is below the port's top edge.
+        const he = x > xEo ? x - xEo : 0;
+        this.liftEx[i] = he;
+        let phi = (this.wEx * he) / this.aHead;
+        g.pPhiL[topo.headerPipe[i]] = phi > 1 ? 1 : phi;
+        const ht = x > this.xTo ? x - this.xTo : 0;
+        this.liftIn[i] = ht;
+        phi = (this.wTr * ht) / this.aTr;
+        g.pPhiR[topo.transferPipe[i]] = phi > 1 ? 1 : phi;
+        const rk = topo.runnerPipe[i];
+        if (induction === 0) {
+          // Reed valve: a sprung petal (damping 0.35) pushed open by the pressure across it.
+          const dp = g.cp[g.pOff[rk] + g.pN[rk] - 1] - pUnder;
+          let rx = this.reedX[i], rv = this.reedV[i];
+          rv += (this.reedW2 * (dp / 6000 - rx) - this.reed2ZW * rv) * dt;
+          rx += rv * dt;
+          if (rx < 0) { rx = 0; if (rv < 0) rv = 0; } else if (rx > 1) { rx = 1; if (rv > 0) rv = 0; }
+          this.reedX[i] = rx;
+          this.reedV[i] = rv;
+          g.pPhiR[rk] = 0.75 * rx;
+        } else if (induction === 1) {
+          // Piston port: the skirt uncovers the inlet around TDC, symmetrically.
+          const hi = x < this.xIo ? this.xIo - x : 0;
+          phi = (this.wInd * hi) / this.aRun;
+          g.pPhiR[rk] = phi > 0.9 ? 0.9 : phi;
+        } else {
+          // Rotary disc: open for a fixed window that closes at a chosen angle after TDC.
+          let d = cur.inductionClose - a;
+          if (d < 0) d += 360;
+          const dur = cur.inductionDuration;
+          const edge = d < dur ? Math.min(d, dur - d) / 12 : 0;
+          g.pPhiR[rk] = 0.9 * (edge > 1 ? 1 : edge);
+        }
+      } else {
+        // Valve lift -> effective orifice area ratio at the pipe ends.
+        let d = a - ci;
+        if (d > 360) d -= 720; else if (d < -360) d += 720;
+        // The lock pin can only move while the high lobe is on its base circle.
+        if (this.hiIn[i] !== wantIn && (2 * d >= durIH || 2 * d <= -durIH)) this.hiIn[i] = wantIn;
+        let xx = (2 * d) / (this.hiIn[i] ? durIH : durIL);
+        let lift = 0;
+        if (xx > -1 && xx < 1) { const f = (xx < 0 ? -xx : xx) * 512, i0 = f | 0; lift = (this.hiIn[i] ? LIH : LIL) * (camTab[i0] + (camTab[i0 + 1] - camTab[i0]) * (f - i0)); }
+        if (lift === 0 && this.liftIn[i] > 0) this.tickEnv += 0.5 + rpm * 2e-4;
+        this.liftIn[i] = lift;
+        let ac = this.kCurtIn * lift;
+        let phi = (ac * this.portIn) / Math.sqrt(ac * ac + this.portIn * this.portIn) / this.aRun;
+        g.pPhiR[topo.runnerPipe[i]] = phi > 1 ? 1 : phi;
 
-      d = a - ce;
-      if (d > 360) d -= 720; else if (d < -360) d += 720;
-      xx = (2 * d) / durE;
-      lift = 0;
-      if (xx > -1 && xx < 1) { const q = 1 - xx * xx; lift = LE * q * q; }
-      if (lift === 0 && this.liftEx[i] > 0) this.tickEnv += 0.5 + rpm * 2e-4;
-      this.liftEx[i] = lift;
-      ac = this.kCurtEx * lift;
-      phi = (ac * this.portEx) / Math.sqrt(ac * ac + this.portEx * this.portEx) / this.aHead;
-      g.pPhiL[topo.headerPipe[i]] = phi > 1 ? 1 : phi;
+        d = a - ce;
+        if (d > 360) d -= 720; else if (d < -360) d += 720;
+        if (this.hiEx[i] !== wantEx && (2 * d >= durEH || 2 * d <= -durEH)) this.hiEx[i] = wantEx;
+        xx = (2 * d) / (this.hiEx[i] ? durEH : durEL);
+        lift = 0;
+        if (xx > -1 && xx < 1) { const f = (xx < 0 ? -xx : xx) * 512, i0 = f | 0; lift = (this.hiEx[i] ? LEH : LEL) * (camTab[i0] + (camTab[i0 + 1] - camTab[i0]) * (f - i0)); }
+        if (lift === 0 && this.liftEx[i] > 0) this.tickEnv += 0.5 + rpm * 2e-4;
+        this.liftEx[i] = lift;
+        ac = this.kCurtEx * lift;
+        phi = (ac * this.portEx) / Math.sqrt(ac * ac + this.portEx * this.portEx) / this.aHead;
+        g.pPhiL[topo.headerPipe[i]] = phi > 1 ? 1 : phi;
+      }
 
       if (dth > 0 && crossed(ap, a, ivcA)) {
         this.veCyl[i] = (m - g.vmY[v]) / (RHO_ATM * Ap * 2 * r);
@@ -529,13 +779,13 @@ export class EngineSim {
 
       // Pressure trace, one bin per crank degree.
       let bin = a | 0;
-      if (bin >= TRACE_BINS) bin = TRACE_BINS - 1;
+      if (bin >= this.cyc) bin = this.cyc - 1;
       let b = this.traceBin[i];
       if (b !== bin) {
         const base = i * TRACE_BINS;
         let guard = 0;
         while (b !== bin && guard++ < 16) {
-          b = b + 1 === TRACE_BINS ? 0 : b + 1;
+          b = b + 1 >= this.cyc ? 0 : b + 1;
           this.trace[base + b] = p;
         }
         this.traceBin[i] = bin;
@@ -545,23 +795,28 @@ export class EngineSim {
     this.sumPcyl = sumP;
 
     // Throttle plate plus idle air valve (integral controller, like a real IAC).
-    const thr = cur.throttle * 0.01;
+    // Per-sample slew: moving the plate in block-sized steps would ring the intake tract.
+    this.thrSm += (cur.throttle * 0.01 - this.thrSm) * this.thrA;
+    const thr = this.thrSm;
     const idleErr = (cur.idleRpm - rpm) / cur.idleRpm;
-    let idleAir = 0;
-    if (thr < 0.02) {
-      // Integrate only near the setpoint so a start-up flare or overrun does not wind it shut.
-      if (sparkOk && idleErr > -0.6) this.iac += 0.5 * idleErr * dt;
-      if (this.iac < 0.1) this.iac = 0.1; else if (this.iac > 8) this.iac = 8;
-      // Gentle proportional trim, plus a strong opening if the engine is about to stall.
-      idleAir = this.iac + 0.5 * idleErr + (idleErr > 0.2 ? 6 * (idleErr - 0.2) : 0);
-      if (idleAir < 0.15) idleAir = 0.15;
-    } else {
-      idleAir = this.iac;
-    }
+    // Idle authority fades out smoothly as the pedal opens, so nothing switches abruptly.
+    const idleW = thr < 0.05 ? 1 - thr * 20 : 0;
+    this.idleW = idleW;
+    this.idleErr = idleErr;
+    if (thr < 0.02 && sparkOk && idleErr > -0.6) this.iac += 0.35 * idleErr * dt;
+    if (this.iac < 0.1) this.iac = 0.1; else if (this.iac > 8) this.iac = 8;
+    // Gentle proportional trim, plus a stronger opening if the engine is about to stall.
+    let trimmed = this.iac + 0.3 * idleErr + (idleErr > 0.25 ? 3 * (idleErr - 0.25) : 0);
+    if (trimmed < 0.15) trimmed = 0.15;
+    const idleAir = this.iac + idleW * (trimmed - this.iac);
     let open = 1 - Math.cos(thr * 0.5 * Math.PI) + this.iacBase * idleAir;
     if (open > 1) open = 1;
     this.throttlePhi = 0.88 * open;
-    g.pPhiR[topo.intakePipe] = this.throttlePhi;
+    const filt = cur.airFilter > 0.5 ? 22 : 0;
+    for (let q = 0; q < topo.intakePipes.length; q++) {
+      g.pPhiR[topo.intakePipes[q]] = this.throttlePhi;
+      g.pResL[topo.intakePipes[q]] = filt;
+    }
 
     this.stepCount++;
     g.step(dt, dt);
@@ -570,19 +825,25 @@ export class EngineSim {
     const sp = (2 * r * 2 * this.omega) / (2 * Math.PI);
     this.meanPistonSpeed = sp;
     const fmep = (0.45 + 0.06 * sp + 0.0015 * sp * sp) * 1e5;
-    const tFric = (fmep * this.VdTot) / (4 * Math.PI);
+    // A two-stroke has no valvetrain but rubs through every revolution's power stroke.
+    const tFric = ((fmep * this.VdTot) / (4 * Math.PI)) * (two ? 1.3 : 1);
     let tStart = 0;
     if (this.starterOn) {
       tStart = this.starterT0 * Math.max(0, 1 - rpm / 380);
       if (this.autoStart) {
         this.autoStartTime += dt;
-        if (rpm > 0.7 * cur.idleRpm || this.autoStartTime > 4) this.autoStart = false;
+        if (rpm > 0.7 * cur.idleRpm || this.autoStartTime > 4) {
+          this.autoStart = false;
+          this.autoStartTime = 0;
+        }
       }
     }
-    const drive = torque + tStart - this.loadK * this.omega * this.omega;
+    // (I + sum m s'^2) dw/dt = T - sum m s' s'' w^2  (energy-consistent reciprocating inertia)
+    const drive = torque + tStart - this.loadK * this.omega * this.omega - cRec * this.omega * this.omega;
+    const inertia = this.inertia + jRec;
     let om = this.omega;
-    if (om > 0) om += ((drive - tFric) / this.inertia) * dt;
-    else if (drive > tFric) om += ((drive - tFric) / this.inertia) * dt;
+    if (om > 0) om += ((drive - tFric) / inertia) * dt;
+    else if (drive > tFric) om += ((drive - tFric) / inertia) * dt;
     if (om < 0) om = 0;
     this.omega = om;
     this.instTorque = torque - tFric;
@@ -592,7 +853,7 @@ export class EngineSim {
     this.mapAcc += g.vp[VOL_PLENUM] * dth;
     this.angAcc += dth;
     this.timeAcc += dt;
-    if (this.angAcc >= 720) {
+    if (this.angAcc >= this.cyc) {
       this.brakeTorque = this.torqueAcc / this.angAcc;
       this.map = this.mapAcc / this.angAcc;
       this.rpmAvg = this.angAcc / this.timeAcc / 6;
@@ -609,13 +870,13 @@ export class EngineSim {
       this.power = this.brakeTorque * this.rpmAvg * 0.104720;
       this.torqueAcc = this.mapAcc = this.angAcc = this.timeAcc = 0;
     }
-    this.mdotAir = g.pMdotL[topo.intakePipe];
+    this.mdotAir = this.intakeFlow();
   }
 
   private audio(dt: number, ts: number): number {
     const g = this.gas;
     const cur = this.cur;
-    const mIn = g.pMdotL[0];
+    const mIn = this.intakeFlow();
     const inv = 1 / dt;
     const pos = this.delayPos;
     // Monopole radiation: p(r) = d(mdot_out)/dt / (4 pi r), summed over outlets.
@@ -627,19 +888,19 @@ export class EngineSim {
       this.srcLp[i] = lp;
       this.srcPrev[i] = m;
       const base = i << 12;
-      this.srcBuf[base + pos] = lp * this.srcGain[i];
-      pEx += this.srcBuf[base + ((pos - this.srcDelay[i]) & 4095)];
+      this.srcBuf[base + pos] = lp;
+      pEx += this.srcBuf[base + ((pos - this.srcDelay[i]) & 4095)] * this.srcGain[i] + this.srcBuf[base + ((pos - this.srcDelay2[i]) & 4095)] * this.srcGain2[i];
     }
     this.lpIn += this.lpA * (-(mIn - this.mInPrev) * inv - this.lpIn);
     this.mInPrev = mIn;
-    this.delayIn[pos] = this.lpIn / (4 * Math.PI * this.rIn);
-    const pIn = this.delayIn[(pos - (this.dIn | 0)) & 4095];
+    this.delayIn[pos] = this.lpIn;
+    const pIn = this.delayIn[(pos - this.dIn) & 4095] * this.gIn + this.delayIn[(pos - this.dIn2) & 4095] * this.gIn2;
     this.delayPos = (pos + 1) & 4095;
 
     // Mechanical noise is NOT simulated: band-passed cylinder pressure for
     // block-radiated combustion noise plus noise bursts at valve closures.
     let pMech = 0;
-    if (ts >= 0.999) {
+    if (ts >= 0.999 && cur.fxMech > 0.5) {
       this.seed = (Math.imul(this.seed, 1664525) + 1013904223) | 0;
       const noise = this.seed * 4.6566e-10;
       this.tickEnv *= this.tickDecay;
@@ -716,6 +977,10 @@ export class EngineSim {
     out[H.substeps] = this.nsub;
     out[H.mdotAir] = this.mdotAir;
     out[H.topoId] = this.topoId;
+    out[H.wallT] = this.headerWallT;
+    out[H.strokes] = this.two ? 2 : 4;
+    out[H.vtc] = this.vtcAdv;
+    out[H.vtec] = this.vtecOn ? 1 : 0;
     out[H.peakOut] = this.peakOut;
     this.peakOut = 0;
     let o = SNAP_HEADER;
@@ -729,7 +994,7 @@ export class EngineSim {
       out[o + C.liftIn] = this.liftIn[i];
       out[o + C.liftEx] = this.liftEx[i];
       out[o + C.flash] = this.flash[i];
-      out[o + C.mdotIn] = g.pMdotR[this.topo.runnerPipe[i]];
+      out[o + C.mdotIn] = g.pMdotR[this.two ? this.topo.transferPipe[i] : this.topo.runnerPipe[i]];
       out[o + C.mdotEx] = g.pMdotL[this.topo.headerPipe[i]];
       o += SNAP_CYL_STRIDE;
     }

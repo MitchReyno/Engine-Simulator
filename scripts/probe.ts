@@ -16,4 +16,4 @@ function report(id: string) {
   sim.setParams({ load: 0 }); sim.run(3); line('WOT free (limiter)');
   void P_ATM;
 }
-for (const id of process.argv.slice(2).length ? process.argv.slice(2) : ['i4', 'thumper', 'v8cross', 'v8flat', 'flat6', 'vtwin', 'i6']) report(id);
+for (const id of process.argv.slice(2).length ? process.argv.slice(2) : ['i4', 'thumper', 'v8cross', 'v8flat', 'flat6', 'vtwin', 'i6', '2t250', '2t350', '2t750']) report(id);

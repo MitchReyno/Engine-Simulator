@@ -1,7 +1,7 @@
 import './style.css';
 import { EngineAudio } from './audio/engine-audio';
 import { LAYOUT_KINDS, cylinderOptions, findLayout } from './sim/layouts';
-import { PRESETS, Params, presetParams } from './sim/params';
+import { PARAM_DEFS, PRESETS, Params, presetParams } from './sim/params';
 import { FLAG_IGNITION, FLAG_LIMITER, FLAG_STARTER, H } from './sim/snapshot';
 import { Controls } from './ui/controls';
 import { Instruments, cylColor } from './ui/instruments';
@@ -21,8 +21,8 @@ const instruments = new Instruments({
 
 // ------------------------------------------------------------- parameters
 
-const KEEP_ON_PRESET = ['volume', 'mixExhaust', 'mixIntake', 'mixMech', 'listenerPos', 'listenerDist', 'timeScale', 'paused', 'cellBudget'];
-const RESTART_KEYS = new Set(['layout', 'cylinders', 'crank', 'firingOrder', 'collector']);
+const KEEP_ON_PRESET = ['volume', 'mixExhaust', 'mixIntake', 'mixMech', 'listenerPos', 'listenerDist', 'timeScale', 'paused', 'cellBudget', ...PARAM_DEFS.filter((d) => d.tiers).map((d) => d.key)];
+const RESTART_KEYS = new Set(['strokes', 'chamberSilencer', 'induction', 'layout', 'cylinders', 'crank', 'firingOrder', 'collector']);
 
 function push(values: Params): void {
   audio.setParams(values);
@@ -44,7 +44,7 @@ function setParam(key: string, value: number): void {
   }
   Object.assign(params, changed);
   for (const k in changed) controls.set(k, changed[k]);
-  if (key in { layout: 1, cylinders: 1, crank: 1, firingOrder: 1, bankAngle: 1, bore: 1, stroke: 1, rodLength: 1, intakeDuration: 1, exhaustDuration: 1, lsa: 1, camAdvance: 1 }) controls.refreshDynamic();
+  if (key in { vtec: 1, vtc: 1, vtcRange: 1, vtecRpm: 1, strokes: 1, induction: 1, exhaustPortOpen: 1, transferPortOpen: 1, layout: 1, cylinders: 1, crank: 1, firingOrder: 1, bankAngle: 1, bore: 1, stroke: 1, rodLength: 1, intakeDuration: 1, exhaustDuration: 1, lsa: 1, camAdvance: 1 }) controls.refreshDynamic();
   push(changed);
   if (RESTART_KEYS.has(key)) audio.autoStart();
   if (key === 'layout' || key === 'cylinders') buildCylChips();
@@ -88,13 +88,13 @@ $('preset-blurb').textContent = PRESETS[0].blurb;
   n2.innerHTML = 'Exhaust and intake are the simulated flow at the pipe mouths. <b>Mechanical is faked</b>: filtered cylinder pressure and valve ticks. See Model notes.';
   audioPanel.appendChild(n2);
 
-  const sim = document.createElement('details');
-  sim.className = 'panel';
-  sim.innerHTML = `<summary>Simulation</summary><div class="panel-body">
+  const sim = document.createElement('div');
+  sim.innerHTML = `<div class="panel-body" style="padding:0">
+    <div class="note">Each row is one aspect of the engine. The badge says what the current choice is: <b style="color:#6fd08c">modelled</b> from physics, <b>approximated</b>, <b style="color:var(--danger)">faked</b>, or left out.</div>
     <label class="row"><div class="row-head"><span class="row-label">Pipe resolution</span>
       <select id="budget"><option value="60">Coarse (60 cells)</option><option value="100">Low (100)</option><option value="140">Medium (140)</option><option value="200">High (200)</option><option value="300">Very high (300)</option></select></div></label>
     <div class="note" id="sim-note">Total finite-volume cells across all pipes. If the audio thread runs out of time this is lowered automatically; the physics is never dropped.</div></div>`;
-  $('controls').appendChild(sim);
+  controls.panels.get('Model fidelity')!.prepend(sim);
   const budget = $<HTMLSelectElement>('budget');
   budget.value = String(params.cellBudget);
   budget.addEventListener('change', () => {
@@ -347,6 +347,9 @@ function updateGauges(dt: number): void {
   $('status').innerHTML =
     `${audio.ctx!.sampleRate / 1000} kHz · ${s.nCells} pipe cells · ${s.h(H.substeps) > 1 ? `<span class="warn">${s.h(H.substeps)} sub-steps</span> · ` : ''}` +
     `audio thread <span class="${load > 0.6 ? 'warn' : ''}">${(load * 100).toFixed(0)} %</span><br>${fps.toFixed(0)} fps` +
+    (params.fxWalls > 0.5 ? ` · header wall ${s.h(H.wallT).toFixed(0)} K` : '') +
+    (params.vtc > 0.5 && s.h(H.strokes) === 4 ? ` · VTC ${s.h(H.vtc).toFixed(0)}°` : '') +
+    (params.vtec > 0.5 && s.h(H.strokes) === 4 ? (s.h(H.vtec) > 0.5 ? ' · <span class="warn">VTEC high cam</span>' : ' · low cam') : '') +
     (resets ? ` · <span class="warn">${resets} solver reset${resets > 1 ? 's' : ''}</span>` : '') +
     (smooth.rpm < 30 && !(flags & FLAG_STARTER) ? ' · <span class="warn">stalled: hold S to crank</span>' : '');
 }

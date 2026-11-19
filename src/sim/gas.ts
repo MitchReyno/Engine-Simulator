@@ -49,6 +49,8 @@ export function orificeMassFlow(aEff: number, p0: number, T0: number, pDown: num
 export interface PipeSpec {
   length: number;
   diameter: number;
+  /** Optional taper: diameter at each of the cells + 1 faces. */
+  profile?: number[];
   cells: number;
   /** Volume index at each end, or -1 for a closed wall. */
   volL: number;
@@ -78,7 +80,7 @@ export class GasNetwork {
   readonly vp: Float64Array;
   readonly vT: Float64Array;
   readonly vY: Float64Array;
-  private readonly vG: Float64Array;
+  readonly vG: Float64Array;
   readonly vFixed: Uint8Array;
   private readonly vdm: Float64Array;
   private readonly vdE: Float64Array;
@@ -96,6 +98,15 @@ export class GasNetwork {
   readonly pPhiL: Float64Array;
   readonly pPhiR: Float64Array;
   readonly pTw: Float64Array;
+  /** Linear flow resistance at each end, Pa per (kg/m^2 s): a filter element. */
+  /** Heat that has flowed from the gas into each pipe's wall since last cleared, J. */
+  readonly pQw: Float64Array;
+  /** Pipes where unburned charge may ignite (afterfire model). */
+  readonly pReact: Uint8Array;
+  /** Heat released per kg of fresh charge burned in a pipe, J/kg. */
+  reactQ = 0;
+  readonly pResL: Float64Array;
+  readonly pResR: Float64Array;
   readonly pFr: Float64Array;
   /** Mass flow rate (kg/s) in +x at the left / right end of each pipe. */
   readonly pMdotL: Float64Array;
@@ -112,6 +123,9 @@ export class GasNetwork {
   readonly cp: Float64Array;
   readonly cc: Float64Array;
   readonly cY: Float64Array;
+  /** Quasi-1D areas: 1 / cell area, and face areas (cells + 1 per pipe, at offset + pipe index). */
+  readonly iaC: Float64Array;
+  readonly aF: Float64Array;
   private readonly ci: Float64Array;
 
   private readonly eRl: Float64Array;
@@ -167,6 +181,10 @@ export class GasNetwork {
     this.pPhiL = new Float64Array(np).fill(1);
     this.pPhiR = new Float64Array(np).fill(1);
     this.pTw = new Float64Array(np);
+    this.pQw = new Float64Array(np);
+    this.pReact = new Uint8Array(np);
+    this.pResL = new Float64Array(np);
+    this.pResR = new Float64Array(np);
     this.pFr = new Float64Array(np);
     this.pMdotL = new Float64Array(np);
     this.pMdotR = new Float64Array(np);
@@ -179,7 +197,6 @@ export class GasNetwork {
       this.pN[k] = n;
       this.pVolL[k] = s.volL;
       this.pVolR[k] = s.volR;
-      this.setPipeGeometry(k, s.length, s.diameter);
       this.pTw[k] = s.wallT;
       this.pFr[k] = s.friction ?? 0.02;
       total += n;
@@ -194,6 +211,9 @@ export class GasNetwork {
     this.cp = new Float64Array(total);
     this.cc = new Float64Array(total);
     this.cY = new Float64Array(total);
+    this.iaC = new Float64Array(total);
+    this.aF = new Float64Array(total + np);
+    for (let k = 0; k < np; k++) this.setPipeGeometry(k, pipes[k].length, pipes[k].diameter, pipes[k].profile);
     this.ci = new Float64Array(total);
     this.eRl = new Float64Array(total);
     this.eUl = new Float64Array(total);
@@ -208,10 +228,22 @@ export class GasNetwork {
     for (let k = 0; k < np; k++) this.setPipeState(k, P_ATM, T_ATM, 0, 0);
   }
 
-  setPipeGeometry(k: number, length: number, diameter: number): void {
-    this.pDx[k] = length / this.pN[k];
+  setPipeGeometry(k: number, length: number, diameter: number, profile?: number[]): void {
+    const n = this.pN[k];
+    const off = this.pOff[k];
+    this.pDx[k] = length / n;
     this.pDiam[k] = diameter;
     this.pArea[k] = 0.25 * Math.PI * diameter * diameter;
+    const fo = off + k;
+    for (let f = 0; f <= n; f++) {
+      const d = profile && profile.length === n + 1 ? profile[f] : diameter;
+      this.aF[fo + f] = 0.25 * Math.PI * d * d;
+    }
+    // frustum volume / dx, so tapered cells hold the right amount of gas
+    for (let i = 0; i < n; i++) {
+      const a0 = this.aF[fo + i], a1 = this.aF[fo + i + 1];
+      this.iaC[off + i] = 3 / (a0 + a1 + Math.sqrt(a0 * a1));
+    }
   }
 
   setPipeState(k: number, p: number, T: number, u: number, Y: number): void {
@@ -257,15 +289,15 @@ export class GasNetwork {
   pipeMass(k: number): number {
     let s = 0;
     const off = this.pOff[k];
-    for (let i = 0; i < this.pN[k]; i++) s += this.rho[off + i];
-    return s * this.pDx[k] * this.pArea[k];
+    for (let i = 0; i < this.pN[k]; i++) s += this.rho[off + i] / this.iaC[off + i];
+    return s * this.pDx[k];
   }
 
   pipeEnergy(k: number): number {
     let s = 0;
     const off = this.pOff[k];
-    for (let i = 0; i < this.pN[k]; i++) s += this.ene[off + i];
-    return s * this.pDx[k] * this.pArea[k];
+    for (let i = 0; i < this.pN[k]; i++) s += this.ene[off + i] / this.iaC[off + i];
+    return s * this.pDx[k];
   }
 
   /**
@@ -273,7 +305,7 @@ export class GasNetwork {
    * direction (into the pipe). Sets bm (inward mass flux per pipe area), bp
    * (face pressure), bh (specific total enthalpy carried), bY and br.
    */
-  private bc(v: number, phi: number, rc: number, wc: number, pc: number, cc: number, Yc: number): void {
+  private bc(v: number, phi: number, rc: number, wc: number, pc: number, cc: number, Yc: number, dpv: number): void {
     const mc = rc * wc;
     // Outgoing characteristic, linearised about the cell: p_f = pStar + cc * m_f.
     // The linearisation fails near sonic inflow, so pStar is floored.
@@ -287,10 +319,10 @@ export class GasNetwork {
       this.br = rc;
       return;
     }
-    const pv = this.vp[v];
+    const pv = this.vp[v] + dpv;
     if (pStar < pv) {
       // Volume -> pipe: upstream stagnation is the volume.
-      const g = phi * this.vG[v];
+      const g = dpv === 0 ? phi * this.vG[v] : (phi * this.vG[v] * pv) / this.vp[v];
       let m: number;
       if (pStar + cc * g <= B_CRIT * pv) {
         m = g; // choked
@@ -358,7 +390,7 @@ export class GasNetwork {
   step(dt: number, srcDt: number): void {
     const { rho, mom, ene, rY, cu, cp, cc, cY, ci } = this;
     const { eRl, eUl, ePl, eRr, eUr, ePr, f0, f1, f2, f3 } = this;
-    const { vdm, vdE, vdmY } = this;
+    const { vdm, vdE, vdmY, iaC, aF } = this;
     let maxRate = 0;
 
     for (let k = 0; k < this.np; k++) {
@@ -367,7 +399,8 @@ export class GasNetwork {
       const dx = this.pDx[k];
       const lam = dt / dx;
       const hl = 0.5 * lam;
-      const area = this.pArea[k];
+      const fo = off + k;
+      const areaL = aF[fo], areaR = aF[fo + n];
       const end = off + n;
 
       let smax = 0;
@@ -431,30 +464,31 @@ export class GasNetwork {
 
       // Left boundary.
       let v = this.pVolL[k];
-      this.bc(v, this.pPhiL[k], rho[off], cu[off], cp[off], cc[off], cY[off]);
+      // a filter's pressure drop uses last step's flux (stable while resistance << c)
+      this.bc(v, this.pPhiL[k], rho[off], cu[off], cp[off], cc[off], cY[off], (-this.pResL[k] * this.pMdotL[k]) / areaL);
       let m = this.bm;
       f0[0] = m;
       f1[0] = this.bp + (m * m) / this.br;
       f2[0] = m * this.bh;
       f3[0] = m * this.bY;
-      this.pMdotL[k] = m * area;
+      this.pMdotL[k] = m * areaL;
       if (v >= 0) {
-        const w = area * dt;
+        const w = areaL * dt;
         vdm[v] -= m * w;
         vdE[v] -= m * this.bh * w;
         vdmY[v] -= m * this.bY * w;
       }
       // Right boundary.
       v = this.pVolR[k];
-      this.bc(v, this.pPhiR[k], rho[jl], -cu[jl], cp[jl], cc[jl], cY[jl]);
+      this.bc(v, this.pPhiR[k], rho[jl], -cu[jl], cp[jl], cc[jl], cY[jl], (this.pResR[k] * this.pMdotR[k]) / areaR);
       m = this.bm;
       f0[n] = -m;
       f1[n] = this.bp + (m * m) / this.br;
       f2[n] = -m * this.bh;
       f3[n] = -m * this.bY;
-      this.pMdotR[k] = -m * area;
+      this.pMdotR[k] = -m * areaR;
       if (v >= 0) {
-        const w = area * dt;
+        const w = areaR * dt;
         vdm[v] -= m * w;
         vdE[v] -= m * this.bh * w;
         vdmY[v] -= m * this.bY * w;
@@ -490,12 +524,18 @@ export class GasNetwork {
       const kf = (fr / (2 * diam)) * srcDt;
       const kh = (4 / diam) * (fr / 8) * GAMMA * srcDt;
       const rtw = R_GAS * this.pTw[k];
+      const react = this.pReact[k] === 1 && this.reactQ > 0;
+      const kReact = Math.min(1, srcDt / 1.5e-3);
+      let qGas = 0;
       for (let i = 0; i < n; i++) {
         const j = off + i;
-        let r = rho[j] - lam * (f0[i + 1] - f0[i]);
-        let mo = mom[j] - lam * (f1[i + 1] - f1[i]);
-        let e = ene[j] - lam * (f2[i + 1] - f2[i]);
-        let y = rY[j] - lam * (f3[i + 1] - f3[i]);
+        // Quasi-1D: fluxes weighted by face area, plus the wall pressure term p dA/dx.
+        const a0 = aF[fo + i], a1 = aF[fo + i + 1];
+        const la = lam * iaC[j];
+        let r = rho[j] - la * (f0[i + 1] * a1 - f0[i] * a0);
+        let mo = mom[j] - la * (f1[i + 1] * a1 - f1[i] * a0 - cp[j] * (a1 - a0));
+        let e = ene[j] - la * (f2[i + 1] * a1 - f2[i] * a0);
+        let y = rY[j] - la * (f3[i + 1] * a1 - f3[i] * a0);
         if (!(r > RHO_MIN)) r = RHO_MIN;
         // positivity of pressure without a division: e*r - mo^2/2 > pmin*r/(g-1)
         if (!(e * r - 0.5 * mo * mo > P_MIN * IG1 * r)) e = P_MIN * IG1 + (0.5 * mo * mo) / r;
@@ -506,7 +546,18 @@ export class GasNetwork {
           const au = Math.abs(mo * iv);
           mo *= 1 - Math.min(0.5, kf * au);
           const p = G1 * (e - 0.5 * mo * mo * iv);
-          e += Math.min(0.5, kh * (au + 5)) * (r * rtw - p) * IG1;
+          const de = Math.min(0.5, kh * (au + 5)) * (r * rtw - p) * IG1;
+          e += de;
+          qGas += de;
+          if (react) {
+            // Afterfire: fresh charge above its ignition temperature burns over ~1.5 ms.
+            const fresh = r - y;
+            if (p * iv > 800 * R_GAS && fresh > 0.25 * r) {
+              const db = fresh * kReact;
+              y += db;
+              e += db * this.reactQ;
+            }
+          }
         }
         if (y < 0) y = 0;
         else if (y > r) y = r;
@@ -515,6 +566,7 @@ export class GasNetwork {
         ene[j] = e;
         rY[j] = y;
       }
+      this.pQw[k] -= qGas * this.pArea[k] * dx;
     }
     this.maxRate = maxRate;
 

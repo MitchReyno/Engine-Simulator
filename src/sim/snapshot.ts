@@ -27,6 +27,12 @@ export const H = {
   mdotAir: 18,
   topoId: 19,
   peakOut: 20,
+  wallT: 21,
+  strokes: 22,
+  /** Intake cam phaser advance, crank degrees. */
+  vtc: 23,
+  /** 1 when the rockers are locked to the high lobes. */
+  vtec: 24,
 } as const;
 
 export const FLAG_STARTER = 1;

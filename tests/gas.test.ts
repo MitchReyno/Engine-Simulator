@@ -130,6 +130,39 @@ describe('finite-volume Euler solver', () => {
   });
 });
 
+describe('tapered pipes (quasi-1D)', () => {
+  const cone = (n: number) => Array.from({ length: n + 1 }, (_, i) => 0.03 + 0.07 * Math.sin((Math.PI * i) / n));
+
+  it('gas at rest in a closed tapered pipe stays at rest', () => {
+    const n = 40;
+    const net = new GasNetwork([{ volume: 1, fixed: true }], [{ length: 1, diameter: 0.03, profile: cone(n), cells: n, volL: -1, volR: -1, wallT: 300, friction: 0 }]);
+    for (let s = 0; s < 3000; s++) net.step(1e-5, 0);
+    for (let i = 0; i < n; i++) {
+      expect(Math.abs(net.cu[i])).toBeLessThan(1e-9);
+      expect(Math.abs(net.cp[i] / P_ATM - 1)).toBeLessThan(1e-12);
+    }
+  });
+
+  it('conserves mass and energy with varying area, and a pulse weakens as the pipe widens', () => {
+    const n = 60;
+    const net = new GasNetwork([{ volume: 1, fixed: true }], [{ length: 1.2, diameter: 0.03, profile: Array.from({ length: n + 1 }, (_, i) => 0.03 + 0.09 * (i / n)), cells: n, volL: -1, volR: -1, wallT: 300, friction: 0 }]);
+    const r0 = P_ATM / (R_GAS * T_ATM), c = Math.sqrt(GAMMA * R_GAS * T_ATM);
+    for (let i = 0; i < n; i++) {
+      const dp = 800 * Math.exp(-(((i - 8) / 3) ** 2));
+      net.setCell(i, r0 * (1 + dp / (GAMMA * P_ATM)), dp / (r0 * c), P_ATM + dp, 0);
+    }
+    const m0 = net.pipeMass(0), e0 = net.pipeEnergy(0);
+    for (let s = 0; s < 120; s++) net.step(2e-5, 0);
+    let peak = 0;
+    for (let i = 0; i < n; i++) peak = Math.max(peak, net.cp[i] - P_ATM);
+    expect(Math.abs(net.pipeMass(0) / m0 - 1)).toBeLessThan(1e-11);
+    expect(Math.abs(net.pipeEnergy(0) / e0 - 1)).toBeLessThan(1e-9);
+    // amplitude falls roughly as 1/sqrt(area): the diffuser sends the rest back as suction
+    expect(peak).toBeLessThan(560);
+    expect(peak).toBeGreaterThan(150);
+  });
+});
+
 describe('orifice flow', () => {
   it('elliptic law stays within 4 % of the isentropic nozzle and chokes at the critical ratio', () => {
     let worst = 0;

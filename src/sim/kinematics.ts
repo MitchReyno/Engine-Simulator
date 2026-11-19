@@ -39,18 +39,21 @@ export function dVolumeDTheta(theta: number, g: CrankGeom): number {
   return pistonArea(g) * r * s * (1 + (r * c) / Math.sqrt(g.rod * g.rod - r * r * s * s));
 }
 
+/** Lobe fullness exponents for the cam profile options: lift = L (1 - x^2)^e. */
+export const CAM_EXPONENTS = [3, 2, 1.3];
+
 /**
  * Valve lift for a symmetric lobe. Duration is seat-to-seat; the profile is
- * (1 - x^2)^2, which has zero lift and zero velocity at both seats.
+ * (1 - x^2)^e, which has zero lift and zero velocity at both seats.
  * All angles in crank degrees on the 720-degree cycle.
  */
-export function camLift(angleDeg: number, centreDeg: number, durationDeg: number, maxLift: number): number {
+export function camLift(angleDeg: number, centreDeg: number, durationDeg: number, maxLift: number, exponent = 2): number {
   let d = angleDeg - centreDeg;
   d -= 720 * Math.floor((d + 360) / 720);
   const x = (2 * d) / durationDeg;
   if (x <= -1 || x >= 1) return 0;
   const q = 1 - x * x;
-  return maxLift * q * q;
+  return exponent === 2 ? maxLift * q * q : maxLift * Math.pow(q, exponent);
 }
 
 export interface ValveEvents {

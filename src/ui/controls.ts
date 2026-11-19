@@ -6,6 +6,17 @@ import { GROUPS, PARAM_DEFS, ParamDef, Params } from '../sim/params';
 
 type Updater = (value: number) => void;
 
+const FOUR_ONLY = [
+  'valvesPerCyl', 'intakeValveSize', 'exhaustValveSize', 'camProfile', 'intakeLift', 'exhaustLift', 'intakeDuration', 'exhaustDuration',
+  'lsa', 'camAdvance', 'firingOrder', 'collector', 'plenumVolume', 'mechDetail',
+  'vtec', 'vtecRpm', 'lowIntakeLift', 'lowExhaustLift', 'lowIntakeDuration', 'lowExhaustDuration', 'vtc', 'vtcRange',
+];
+const VTEC_ROWS = ['vtecRpm', 'lowIntakeLift', 'lowExhaustLift', 'lowIntakeDuration', 'lowExhaustDuration'];
+const TWO_ONLY = [
+  'exhaustPortOpen', 'transferPortOpen', 'crankcaseCR', 'exhaustPortWidth', 'transferPortWidth', 'powerValve', 'induction',
+  'reedStiffness', 'inductionDuration', 'inductionClose', 'chamberDiameter', 'chamberSilencer',
+];
+
 const fmt = (d: ParamDef, v: number): string => {
   const decimals = d.step >= 1 ? 0 : d.step >= 0.1 ? 1 : 2;
   return v.toFixed(decimals);
@@ -38,7 +49,7 @@ export class Controls {
       for (const d of PARAM_DEFS) if (d.group === group) body.appendChild(this.row(d));
       if (group === 'Intake') body.insertBefore(this.row(PARAM_DEFS.find((d) => d.key === 'throttle')!, 'Throttle (same as Running)'), body.firstChild);
       if (group === 'Engine') body.appendChild((this.readouts.engine = el('div', 'readout')));
-      if (group === 'Valvetrain') body.appendChild((this.readouts.valves = el('div', 'readout')));
+      if (group === 'Valves & ports') body.appendChild((this.readouts.valves = el('div', 'readout')));
       root.appendChild(det);
     }
     this.refreshDynamic();
@@ -78,9 +89,27 @@ export class Controls {
       for (const [i, o] of (d.options ?? []).entries()) select.appendChild(new Option(o, String(i)));
       select.addEventListener('change', () => this.onChange(d.key, Number(select.value)));
       this.selects.set(d.key, select);
-      this.bind(d.key, (v) => (select.value = String(v)));
       select.value = String(this.params[d.key]);
-      head.appendChild(select);
+      if (d.tiers) {
+        // Fidelity option: say plainly whether the chosen setting is physics, approximation or fake.
+        const badge = el('span', 'tier');
+        const hint = el('div', 'row-hint', d.hint ?? '');
+        const show = (v: number) => {
+          select.value = String(v);
+          const tier = d.tiers![v | 0] ?? 'off';
+          badge.className = `tier tier-${tier}`;
+          badge.textContent = tier === 'off' ? 'not modelled' : tier;
+        };
+        this.bind(d.key, show);
+        show(this.params[d.key]);
+        const right = el('span', 'row-right');
+        right.append(badge, select);
+        head.appendChild(right);
+        row.appendChild(hint);
+      } else {
+        this.bind(d.key, (v) => (select.value = String(v)));
+        head.appendChild(select);
+      }
     } else {
       const input = el('input');
       input.type = 'checkbox';
@@ -117,17 +146,40 @@ export class Controls {
     fill('cylinders', cylinderOptions(kind).map((n) => [String(n), n]), p.cylinders);
     const def = findLayout(kind, p.cylinders | 0);
     fill('crank', def.cranks.map((c, i) => [c.name, i]), p.crank);
-    const res = resolveLayout(kind, p.cylinders | 0, p.bankAngle, p.crank | 0, p.firingOrder | 0);
+    const two = p.strokes > 0.5;
+    const res = resolveLayout(kind, p.cylinders | 0, p.bankAngle, p.crank | 0, p.firingOrder | 0, two);
     fill('firingOrder', res.orderLabels.map((l, i) => [l, i]), res.orderIndex);
     this.rows.get('bankAngle')!.style.display = kind === 'v' ? '' : 'none';
+    // Show only the rows that exist on this kind of engine.
+    for (const k of FOUR_ONLY) this.rows.get(k)!.style.display = two ? 'none' : '';
+    for (const k of TWO_ONLY) this.rows.get(k)!.style.display = two ? '' : 'none';
+    if (!two) {
+      const vt = p.vtec | 0;
+      for (const k of VTEC_ROWS) this.rows.get(k)!.style.display = vt === 0 || (vt === 2 && k.includes('Exhaust')) ? 'none' : '';
+      this.rows.get('vtcRange')!.style.display = p.vtc > 0.5 ? '' : 'none';
+    }
+    if (two) {
+      const ind = p.induction | 0;
+      this.rows.get('reedStiffness')!.style.display = ind === 0 ? '' : 'none';
+      this.rows.get('inductionDuration')!.style.display = ind === 0 ? 'none' : '';
+      this.rows.get('inductionClose')!.style.display = ind === 2 ? '' : 'none';
+    }
 
     const cc = 0.25 * Math.PI * p.bore * p.bore * p.stroke * 1e-3;
     const even = res.intervals.every((d) => Math.abs(d - res.intervals[0]) < 0.5);
     this.readouts.engine.innerHTML =
       `<b>${((cc * res.n) / 1000).toFixed(2)} L</b> (${cc.toFixed(0)} cc × ${res.n}) · bore/stroke ${(p.bore / p.stroke).toFixed(2)} · rod ratio ${(p.rodLength / p.stroke).toFixed(2)}<br>` +
-      `firing intervals ${even ? `<b>${Math.round(res.intervals[0])}°</b> even` : res.intervals.map((d) => Math.round(d)).join('–') + '°'}`;
-    const ev = valveEvents(p.intakeDuration, p.exhaustDuration, p.lsa, p.camAdvance);
-    this.readouts.valves.innerHTML =
-      `overlap <b>${Math.round(ev.overlap)}°</b> · intake centre ${Math.round(ev.intakeCentre - 360)}° ATDC · exhaust centre ${Math.round(360 - ev.exhaustCentre)}° BTDC`;
+      `${two ? 'two-stroke, ' : ''}firing intervals ${even ? `<b>${Math.round(res.intervals[0])}°</b> even` : res.intervals.map((d) => Math.round(d)).join('–') + '°'}`;
+    if (two) {
+      const tpo = Math.max(p.transferPortOpen, p.exhaustPortOpen + 2);
+      this.readouts.valves.innerHTML =
+        `exhaust port open <b>${Math.round(360 - 2 * p.exhaustPortOpen)}°</b> · transfer <b>${Math.round(360 - 2 * tpo)}°</b> · blowdown ${Math.round(tpo - p.exhaustPortOpen)}°<br>` +
+        `tuned length (exhaust slider) sets where the engine comes on the pipe`;
+    } else {
+      const ev = valveEvents(p.intakeDuration, p.exhaustDuration, p.lsa, p.camAdvance);
+      this.readouts.valves.innerHTML =
+        `overlap <b>${Math.round(ev.overlap)}°</b>${p.vtc > 0.5 ? ` to <b>${Math.round(Math.max(0, ev.overlap + p.vtcRange))}°</b> with the phaser` : ''} · intake centre ${Math.round(ev.intakeCentre - 360)}° ATDC · exhaust centre ${Math.round(360 - ev.exhaustCentre)}° BTDC` +
+        (p.vtec > 0.5 ? `<br>lift and duration sliders are the high-speed lobes; low-speed lobes run below ${Math.round(p.vtecRpm)} rpm` : '');
+    }
   }
 }
