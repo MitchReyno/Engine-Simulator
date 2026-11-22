@@ -19,6 +19,7 @@
           <button data-color="temperature">Temperature</button>
           <button data-color="gas">Fresh / burned</button>
         </div>
+        <button id="drive" class="toggle" title="Put this engine in a car and drive it round a circuit">Drive</button>
         <button id="cutaway" class="toggle">Cutaway</button>
         <button id="exploded" class="toggle">Exploded</button>
         <button id="about">Model notes</button>
@@ -28,6 +29,24 @@
         <section id="left">
           <div id="stage">
             <div id="view3d"></div>
+            <div id="viewdrive" hidden></div>
+            <div id="hud" hidden>
+              <div id="hud-laps">
+                <div><span class="k">Lap</span><b id="hud-lap">0:00.0</b></div>
+                <div><span class="k">Last</span><b id="hud-last">–</b></div>
+                <div><span class="k">Best</span><b id="hud-best">–</b></div>
+              </div>
+              <canvas id="hud-map" width="180" height="150"></canvas>
+              <div id="hud-dash">
+                <div id="hud-revs"><div id="hud-rev-fill"></div></div>
+                <div id="hud-row">
+                  <div id="hud-gear">N</div>
+                  <div id="hud-speed"><b>0</b><span>km/h</span></div>
+                  <div id="hud-aids"><span id="hud-abs">ABS</span><span id="hud-tc">TC</span><span id="hud-off">OFF TRACK</span></div>
+                </div>
+              </div>
+              <div id="hud-keys" class="muted"><kbd>W</kbd>/<kbd>S</kbd> throttle, brake · <kbd>A</kbd>/<kbd>D</kbd> steer · <kbd>E</kbd>/<kbd>Q</kbd> gear up, down · <kbd>C</kbd> clutch · <kbd>R</kbd> back to track · <kbd>G</kbd> grid · <kbd>V</kbd> camera · gamepad supported</div>
+            </div>
             <div id="legend"><div id="legend-bar"></div><div id="legend-labels"><span></span><span></span><span></span></div></div>
             <div id="partlabel" hidden><b></b><p></p></div>
             <div id="hint" class="muted">drag to orbit · scroll to zoom · click a part</div>

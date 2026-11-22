@@ -3,6 +3,8 @@ import { EngineAudio } from './audio/engine-audio';
 import { LAYOUT_KINDS, cylinderOptions, findLayout } from './sim/layouts';
 import { PARAM_DEFS, PRESETS, Params, presetParams } from './sim/params';
 import { FLAG_IGNITION, FLAG_LIMITER, FLAG_STARTER, H } from './sim/snapshot';
+import { CIRCUIT } from './sim/track';
+import { DriveView } from './view3d/driveView';
 import { Controls } from './ui/controls';
 import { Instruments, cylColor } from './ui/instruments';
 import { MODEL_NOTES_HTML } from './ui/modelNotes';
@@ -21,12 +23,13 @@ const instruments = new Instruments({
 
 // ------------------------------------------------------------- parameters
 
-const KEEP_ON_PRESET = ['volume', 'mixExhaust', 'mixIntake', 'mixMech', 'listenerPos', 'listenerDist', 'timeScale', 'paused', 'cellBudget', ...PARAM_DEFS.filter((d) => d.tiers).map((d) => d.key)];
-const RESTART_KEYS = new Set(['strokes', 'chamberSilencer', 'induction', 'layout', 'cylinders', 'crank', 'firingOrder', 'collector']);
+const KEEP_ON_PRESET = ['drive', 'autoShift', 'autoClutch', 'abs', 'tc', 'mixCar', 'volume', 'mixExhaust', 'mixIntake', 'mixMech', 'listenerPos', 'listenerDist', 'timeScale', 'paused', 'cellBudget', ...PARAM_DEFS.filter((d) => d.tiers).map((d) => d.key)];
+const RESTART_KEYS = new Set(['rearSplit', 'catalyst', 'mufflerType', 'strokes', 'chamberSilencer', 'induction', 'layout', 'cylinders', 'crank', 'firingOrder', 'collector']);
 
 function push(values: Params): void {
   audio.setParams(values);
   view.setParams(params);
+  driveView?.setParams(params);
 }
 
 function setParam(key: string, value: number): void {
@@ -87,6 +90,37 @@ $('preset-blurb').textContent = PRESETS[0].blurb;
   n2.className = 'note';
   n2.innerHTML = 'Exhaust and intake are the simulated flow at the pipe mouths. <b>Mechanical is faked</b>: filtered cylinder pressure and valve ticks. See Model notes.';
   audioPanel.appendChild(n2);
+  const recRow = document.createElement('div');
+  recRow.className = 'btn-row';
+  recRow.innerHTML = `<button id="record" title="Saves the next 10 seconds of sound as a WAV file, with the settings in use">Record 10 s</button><span class="note">saves a WAV of exactly what is playing</span>`;
+  audioPanel.appendChild(recRow);
+  $('record').addEventListener('click', async () => {
+    const btn = $<HTMLButtonElement>('record');
+    if (!audio.ctx || btn.disabled) return;
+    btn.disabled = true;
+    btn.textContent = 'Recording…';
+    const x = await audio.record(10);
+    const sr = audio.ctx.sampleRate;
+    const wav = new DataView(new ArrayBuffer(44 + x.length * 2));
+    const text = (o: number, t: string) => [...t].forEach((ch, i) => wav.setUint8(o + i, ch.charCodeAt(0)));
+    text(0, 'RIFF'); wav.setUint32(4, 36 + x.length * 2, true); text(8, 'WAVEfmt '); wav.setUint32(16, 16, true);
+    wav.setUint16(20, 1, true); wav.setUint16(22, 1, true); wav.setUint32(24, sr, true); wav.setUint32(28, sr * 2, true);
+    wav.setUint16(32, 2, true); wav.setUint16(34, 16, true); text(36, 'data'); wav.setUint32(40, x.length * 2, true);
+    for (let i = 0; i < x.length; i++) wav.setInt16(44 + i * 2, Math.round(Math.max(-1, Math.min(1, x[i])) * 32767), true);
+    const stamp = new Date().toISOString().slice(11, 19).replace(/:/g, '');
+    const save = (blob: Blob, name: string) => {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = name;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    };
+    save(new Blob([wav.buffer], { type: 'audio/wav' }), `engine-sim-${presetId}-${stamp}.wav`);
+    // the settings that produced it, so the sound can be reproduced
+    save(new Blob([JSON.stringify(params, null, 1)], { type: 'application/json' }), `engine-sim-${presetId}-${stamp}.json`);
+    btn.disabled = false;
+    btn.textContent = 'Record 10 s';
+  });
 
   const sim = document.createElement('div');
   sim.innerHTML = `<div class="panel-body" style="padding:0">
@@ -155,7 +189,7 @@ pedal.addEventListener('pointermove', (e) => pedalHeld && pedalFromEvent(e));
 for (const ev of ['pointerup', 'pointercancel']) pedal.addEventListener(ev, () => (pedalHeld = false));
 
 function tickThrottle(dt: number): void {
-  const target = pedalHeld ? pedalValue : keyHeld ? 100 : throttleBase;
+  const target = pedalHeld ? pedalValue : keyHeld ? 100 : padThrottle > 0 ? padThrottle : driving ? 0 : throttleBase;
   const rate = (target > throttleLive ? 500 : 700) * dt;
   const next = Math.abs(target - throttleLive) <= rate ? target : throttleLive + Math.sign(target - throttleLive) * rate;
   if (next !== throttleLive) {
@@ -181,19 +215,164 @@ window.addEventListener('keydown', (e) => {
   if (k === ' ' || k === 'w' || k === 'arrowup') {
     keyHeld = true;
     e.preventDefault();
-  } else if (k === 's') setStarter(true);
+  } else if (driving && driveKey(k, true, e.repeat)) e.preventDefault();
+  else if (k === 's') setStarter(true);
   else if (k === 'i' && !e.repeat) setParam('ignition', params.ignition > 0.5 ? 0 : 1);
   else if (k === 'p' && !e.repeat) togglePause();
 });
 window.addEventListener('keyup', (e) => {
   const k = e.key.toLowerCase();
   if (k === ' ' || k === 'w' || k === 'arrowup') keyHeld = false;
+  else if (driving && driveKey(k, false, false)) return;
   else if (k === 's') setStarter(false);
 });
 window.addEventListener('blur', () => {
   keyHeld = false;
+  held.left = held.right = held.brake = held.clutch = false;
   setStarter(false);
 });
+
+// ------------------------------------------------------------ driving mode
+
+let driving = false;
+let driveView: DriveView | null = null;
+let padThrottle = 0;
+const held = { left: false, right: false, brake: false, clutch: false };
+const driveIn = { steer: 0, brake: 0, clutch: 0 };
+const padPrev = { up: false, down: false, reset: false, cam: false };
+
+function driveKey(k: string, down: boolean, repeat: boolean): boolean {
+  if (k === 'a' || k === 'arrowleft') held.left = down;
+  else if (k === 'd' || k === 'arrowright') held.right = down;
+  else if (k === 's' || k === 'arrowdown') held.brake = down;
+  else if (k === 'c') held.clutch = down;
+  else if (k === 'enter') setStarter(down);
+  else if (k.length === 1 && 'eqrgv'.includes(k)) {
+    if (!down || repeat) return true;
+    if (k === 'e') audio.shift(1);
+    else if (k === 'q') audio.shift(-1);
+    else if (k === 'r') audio.resetCar(false);
+    else if (k === 'g') audio.resetCar(true);
+    else driveView?.nextCamera();
+  } else return false;
+  return true;
+}
+
+function setDriving(on: boolean): void {
+  driving = on;
+  $('drive').classList.toggle('on', on);
+  $('stage').classList.toggle('driving', on);
+  $('viewdrive').hidden = !on;
+  $('hud').hidden = !on;
+  if (on && !driveView) {
+    driveView = new DriveView($('viewdrive'));
+    driveView.setParams(params);
+    drawMapBase();
+  }
+  params.drive = on ? 1 : 0;
+  if (on && params.paused) togglePause();
+  if (on && params.timeScale < 0.999) {
+    speed.value = '0';
+    speed.dispatchEvent(new Event('input'));
+  }
+  audio.setParams({ drive: params.drive, steer: 0, brake: 0, clutch: 0 });
+  (document.activeElement as HTMLElement | null)?.blur();
+}
+$('drive').addEventListener('click', () => setDriving(!driving));
+
+/** Keyboard and gamepad to steering, brake and clutch; throttle goes through the pedal logic. */
+function tickDrive(dt: number): void {
+  const s = audio.snap;
+  const v = s ? Math.hypot(s.h(H.carVx), s.h(H.carVy)) : 0;
+  // Keys are all-or-nothing, so limit lock to roughly what the tyres can use at this speed.
+  const usable = Math.min(1, Math.max(0.06, (2.2 * 2.67 * 9.81 * params.tyreGrip) / Math.max(1, v * v) / 0.58 + 0.035));
+  let steer = driveIn.steer, brake = driveIn.brake;
+  const pad = navigator.getGamepads?.().find((g) => g && g.connected && g.axes.length >= 2) ?? null;
+  const dir = (held.left ? 1 : 0) - (held.right ? 1 : 0);
+  if (pad && Math.abs(pad.axes[0]) > 0.06 && dir === 0) {
+    const ax = -pad.axes[0];
+    steer = Math.sign(ax) * Math.pow(Math.abs(ax), 1.5) * (0.3 + 0.7 * usable) * 100;
+  } else {
+    const target = dir * usable * 100;
+    const rate = (dir === 0 || Math.sign(target) !== Math.sign(steer) ? 320 : 170) * dt * Math.max(usable, 0.25);
+    steer = Math.abs(target - steer) <= rate ? target : steer + Math.sign(target - steer) * rate;
+  }
+  const padBrake = pad ? pad.buttons[6]?.value ?? 0 : 0;
+  padThrottle = pad ? (pad.buttons[7]?.value ?? 0) * 100 : 0;
+  const brakeTarget = held.brake ? 100 : padBrake * 100;
+  const br = (brakeTarget > brake ? 450 : 900) * dt;
+  brake = Math.abs(brakeTarget - brake) <= br ? brakeTarget : brake + Math.sign(brakeTarget - brake) * br;
+  const clutch = held.clutch ? 100 : 0;
+  if (pad) {
+    const b = (i: number) => !!pad.buttons[i]?.pressed;
+    if (b(5) && !padPrev.up) audio.shift(1);
+    if (b(4) && !padPrev.down) audio.shift(-1);
+    if (b(3) && !padPrev.reset) audio.resetCar(false);
+    if (b(2) && !padPrev.cam) driveView?.nextCamera();
+    padPrev.up = b(5); padPrev.down = b(4); padPrev.reset = b(3); padPrev.cam = b(2);
+  }
+  if (steer !== driveIn.steer || brake !== driveIn.brake || clutch !== driveIn.clutch) {
+    driveIn.steer = steer; driveIn.brake = brake; driveIn.clutch = clutch;
+    audio.setParams({ steer, brake, clutch });
+  }
+  if (driveView) driveView.brake = brake / 100;
+}
+
+const mapBase = document.createElement('canvas');
+const MAP = { scale: 1, ox: 0, oy: 0 };
+function drawMapBase(): void {
+  const c = $<HTMLCanvasElement>('hud-map');
+  mapBase.width = c.width; mapBase.height = c.height;
+  const t = CIRCUIT;
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  for (let i = 0; i < t.n; i++) { x0 = Math.min(x0, t.x[i]); x1 = Math.max(x1, t.x[i]); y0 = Math.min(y0, t.y[i]); y1 = Math.max(y1, t.y[i]); }
+  MAP.scale = Math.min((c.width - 20) / (x1 - x0), (c.height - 20) / (y1 - y0));
+  MAP.ox = 10 - x0 * MAP.scale + 0.5 * (c.width - 20 - (x1 - x0) * MAP.scale);
+  MAP.oy = c.height - 10 + y0 * MAP.scale - 0.5 * (c.height - 20 - (y1 - y0) * MAP.scale);
+  const g = mapBase.getContext('2d')!;
+  g.strokeStyle = '#e8edf2';
+  g.lineWidth = 3;
+  g.lineJoin = 'round';
+  g.beginPath();
+  for (let i = 0; i <= t.n; i += 2) {
+    const k = i % t.n;
+    const px = MAP.ox + t.x[k] * MAP.scale, py = MAP.oy - t.y[k] * MAP.scale;
+    i === 0 ? g.moveTo(px, py) : g.lineTo(px, py);
+  }
+  g.closePath();
+  g.stroke();
+  g.fillStyle = '#ffb000';
+  g.fillRect(MAP.ox + t.x[0] * MAP.scale - 1.5, MAP.oy - t.y[0] * MAP.scale - 6, 3, 12);
+}
+
+const lapText = (sec: number) => (sec > 0 ? `${Math.floor(sec / 60)}:${(sec % 60).toFixed(sec < 600 ? 2 : 1).padStart(5, '0')}` : '–');
+function updateHud(): void {
+  const s = audio.snap;
+  if (!s) return;
+  const v = Math.hypot(s.h(H.carVx), s.h(H.carVy));
+  $('hud-speed').firstElementChild!.textContent = String(Math.round(v * 3.6));
+  const gear = s.h(H.carGear);
+  $('hud-gear').textContent = gear < 0 ? 'R' : gear === 0 ? 'N' : String(gear);
+  const frac = Math.min(1, s.h(H.rpm) / params.revLimit);
+  const fill = $('hud-rev-fill');
+  fill.style.width = `${frac * 100}%`;
+  fill.className = frac > 0.93 ? 'shift' : frac > 0.8 ? 'high' : '';
+  $('hud-lap').textContent = lapText(s.h(H.lapTime)).replace('–', '0:00.00');
+  $('hud-last').textContent = lapText(s.h(H.lastLap));
+  $('hud-best').textContent = lapText(s.h(H.bestLap));
+  const aids = s.h(H.carAids);
+  $('hud-abs').classList.toggle('on', !!(aids & 1));
+  $('hud-tc').classList.toggle('on', !!(aids & 2));
+  $('hud-off').classList.toggle('on', s.h(H.carGrass) > 0.4);
+  const c = $<HTMLCanvasElement>('hud-map');
+  const g = c.getContext('2d')!;
+  g.clearRect(0, 0, c.width, c.height);
+  g.drawImage(mapBase, 0, 0);
+  g.fillStyle = '#ff4d5e';
+  g.beginPath();
+  g.arc(MAP.ox + s.h(H.carX) * MAP.scale, MAP.oy - s.h(H.carY) * MAP.scale, 4, 0, 7);
+  g.fill();
+}
 
 // ------------------------------------------------------------ time control
 
@@ -347,6 +526,7 @@ function updateGauges(dt: number): void {
   $('status').innerHTML =
     `${audio.ctx!.sampleRate / 1000} kHz · ${s.nCells} pipe cells · ${s.h(H.substeps) > 1 ? `<span class="warn">${s.h(H.substeps)} sub-steps</span> · ` : ''}` +
     `audio thread <span class="${load > 0.6 ? 'warn' : ''}">${(load * 100).toFixed(0)} %</span><br>${fps.toFixed(0)} fps` +
+    ` · ${Math.max(0, s.h(H.spl)).toFixed(0)} dB SPL` +
     (params.fxWalls > 0.5 ? ` · header wall ${s.h(H.wallT).toFixed(0)} K` : '') +
     (params.vtc > 0.5 && s.h(H.strokes) === 4 ? ` · VTC ${s.h(H.vtc).toFixed(0)}°` : '') +
     (params.vtec > 0.5 && s.h(H.strokes) === 4 ? (s.h(H.vtec) > 0.5 ? ' · <span class="warn">VTEC high cam</span>' : ' · low cam') : '') +
@@ -362,8 +542,12 @@ function loop(now: number): void {
   const dt = Math.min(0.1, (now - last) / 1000);
   last = now;
   fps += (1 / Math.max(1e-3, dt) - fps) * 0.05;
+  if (driving) tickDrive(dt);
   tickThrottle(dt);
-  view.render(audio.snap, dt);
+  if (driving) {
+    driveView!.render(audio.snap, dt);
+    updateHud();
+  } else view.render(audio.snap, dt);
   if (view.labelPos && !partLabel.hidden) {
     partLabel.style.left = `${view.labelPos.x}px`;
     partLabel.style.top = `${view.labelPos.y}px`;
@@ -383,4 +567,4 @@ $('controls').addEventListener('input', (e) => {
 });
 
 // Debug handle for inspecting the running simulation from the console.
-(window as any).engineSim = { audio, view, instruments, get params() { return params; }, setParam, applyPreset };
+(window as any).engineSim = { audio, view, instruments, setDriving, get driveView() { return driveView; }, get params() { return params; }, setParam, applyPreset };

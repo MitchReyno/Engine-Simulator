@@ -3,8 +3,13 @@
 import { ResolvedLayout } from './layouts';
 import { Params } from './params';
 
+/** Flow resistance of a catalyst brick: about 4 kPa at 100 kg/m2s. */
+export const CAT_RES = 40;
+/** Flow resistance leaving the muffler: an empty chamber, a perforated straight-through core, baffles. */
+export const MUFFLER_RES = [0, 12, 35];
+
 export type PipeKind = 'intake' | 'runner' | 'transfer' | 'header' | 'mid' | 'tail';
-export type VolumeKind = 'ambient' | 'plenum' | 'cylinder' | 'crankcase' | 'junction' | 'muffler';
+export type VolumeKind = 'ambient' | 'plenum' | 'cylinder' | 'crankcase' | 'junction' | 'muffler' | 'catalyst';
 
 export interface TopoPipe {
   kind: PipeKind;
@@ -18,6 +23,9 @@ export interface TopoPipe {
   cells: number;
   /** Right end opens to ambient and radiates sound. */
   radiates: boolean;
+  /** Linear flow resistance at an end, Pa per kg/m2s (catalyst brick, muffler baffle). */
+  resL?: number;
+  resR?: number;
   /** Diameter at fractions of the length, for tapered pipes (expansion chambers). */
   shape?: [number, number][];
   /** Per-face diameters derived from shape once the cell count is known. */
@@ -80,14 +88,18 @@ export function buildTopology(p: Params, layout: ResolvedLayout, dt: number): To
   const group = collector === 0 ? new Array(n).fill(0) : layout.group;
   const nGroups = collector === 3 ? 0 : Math.max(...group) + 1;
   const headerPipe: number[] = [];
+  // Unequal primaries: outer cylinders get longer pipes than inner ones, as in a compact manifold.
+  const slots = layout.def.slot, sMin = Math.min(...slots), sMax = Math.max(...slots);
+  const spread = (i: number) => (sMax > sMin ? 1 + p.headerSpread * 0.01 * (Math.abs((2 * (slots[i] - sMin)) / (sMax - sMin) - 1) - 0.5) : 1);
 
   if (collector === 3) {
     for (let i = 0; i < n; i++) {
       headerPipe.push(pipes.length);
-      pipes.push({ kind: 'header', cyl: i, group: i, length: p.headerLength * MM, diameter: dHead, volL: VOL_CYL0 + i, volR: VOL_AMBIENT, wallT: 650, cells: 0, radiates: true });
+      pipes.push({ kind: 'header', cyl: i, group: i, length: p.headerLength * MM * spread(i), diameter: dHead, volL: VOL_CYL0 + i, volR: VOL_AMBIENT, wallT: 650, cells: 0, radiates: true });
     }
   } else {
-    const nMuff = collector === 2 ? nGroups : 1;
+    const split = p.rearSplit > 0.5 && collector < 2;
+    const nMuff = split ? 2 : collector === 2 ? nGroups : 1;
     const muffler0 = volumes.length;
     for (let m = 0; m < nMuff; m++) volumes.push({ kind: 'muffler', group: m, volume: (p.mufflerVolume * 1e-3) / nMuff });
     const dMid = collector === 1 && nGroups > 1 ? dTail * 0.8 : dTail;
@@ -96,7 +108,7 @@ export function buildTopology(p: Params, layout: ResolvedLayout, dt: number): To
     const pending: { i: number; g: number; to: number; extra: number }[] = [];
     for (let g = 0; g < nGroups; g++) {
       const muff = muffler0 + (collector === 2 ? g : 0);
-      if (members[g].length === 1) {
+      if (members[g].length === 1 && !split) {
         // One cylinder in the group: no merge, the header runs straight to the muffler.
         pending.push({ i: members[g][0], g, to: muff, extra: p.midLength * MM });
       } else {
@@ -108,15 +120,43 @@ export function buildTopology(p: Params, layout: ResolvedLayout, dt: number): To
     pending.sort((a, b) => a.i - b.i);
     for (const h of pending) {
       headerPipe.push(pipes.length);
-      pipes.push({ kind: 'header', cyl: h.i, group: h.g, length: p.headerLength * MM + h.extra, diameter: dHead, volL: VOL_CYL0 + h.i, volR: h.to, wallT: 650, cells: 0, radiates: false });
+      pipes.push({ kind: 'header', cyl: h.i, group: h.g, length: p.headerLength * MM * spread(h.i) + h.extra, diameter: dHead, volL: VOL_CYL0 + h.i, volR: h.to, wallT: 650, cells: 0, radiates: false });
     }
-    for (let v = 0; v < volumes.length; v++) {
-      if (volumes[v].kind !== 'junction') continue;
-      const g = volumes[v].group;
-      pipes.push({ kind: 'mid', cyl: -1, group: g, length: p.midLength * MM, diameter: dMid, volL: v, volR: muffler0 + (collector === 2 ? g : 0), wallT: 550, cells: 0, radiates: false });
+    const extra: TopoVolume[] = [];
+    const addVol = (v: TopoVolume) => volumes.length + extra.push(v) - 1;
+    const mid = (from: number, to: number, length: number, diameter: number, g: number, wallT: number, resR?: number) =>
+      pipes.push({ kind: 'mid', cyl: -1, group: g, length, diameter, volL: from, volR: to, wallT, cells: 0, radiates: false, resR });
+    // The main pipe, with the catalytic converter a third of the way along if fitted: a can holding a
+    // honeycomb brick, which the gas crosses as laminar flow, so its pressure drop is proportional to the flow.
+    const main = (from: number, to: number, length: number, diameter: number, g: number) => {
+      if (p.catalyst > 0.5) {
+        const cat = addVol({ kind: 'catalyst', group: g, volume: 1.2e-3 * Math.max(1, (diameter / 0.05) ** 2) });
+        mid(from, cat, 0.35 * length, diameter, g, 600, CAT_RES);
+        mid(cat, to, 0.65 * length, diameter, g, 520);
+      } else mid(from, to, length, diameter, g, 550);
+    };
+    const junctions: number[] = [];
+    volumes.forEach((v, idx) => v.kind === 'junction' && junctions.push(idx));
+    const L = p.midLength * MM;
+    if (!split) {
+      for (const v of junctions) main(v, muffler0 + (collector === 2 ? volumes[v].group : 0), L, dMid, volumes[v].group);
+    } else {
+      // One pipe runs back from the engine and splits in a Y to a muffler and tailpipe on each side.
+      const dMain = dTail * 1.2;
+      let from = junctions[0], rest = 0.65;
+      if (junctions.length > 1) {
+        // 4-2-1: the secondaries merge before the main pipe
+        from = addVol({ kind: 'junction', group: 0, volume: (junctions.length * area(dMid) + area(dMain)) * 0.08 });
+        for (const v of junctions) mid(v, from, 0.15 * L, dMid, volumes[v].group, 600);
+        rest = 0.5;
+      }
+      const y = addVol({ kind: 'junction', group: 0, volume: (area(dMain) + 2 * area(dTail)) * 0.08 });
+      main(from, y, rest * L, dMain, 0);
+      for (let m = 0; m < 2; m++) mid(y, muffler0 + m, 0.35 * L, dTail, m, 480);
     }
+    volumes.push(...extra);
     for (let m = 0; m < nMuff; m++) {
-      pipes.push({ kind: 'tail', cyl: -1, group: m, length: p.tailLength * MM, diameter: dTail, volL: muffler0 + m, volR: VOL_AMBIENT, wallT: 450, cells: 0, radiates: true });
+      pipes.push({ kind: 'tail', cyl: -1, group: m, length: p.tailLength * MM, diameter: dTail, volL: muffler0 + m, volR: VOL_AMBIENT, wallT: 450, cells: 0, radiates: true, resL: MUFFLER_RES[p.mufflerType | 0] ?? 0 });
     }
   }
 
@@ -194,7 +234,8 @@ function finish(
       const a = q.diameter / 2;
       for (const [v, isRight] of [[q.volL, false], [q.volR, true]] as [number, boolean][]) {
         const kind = volumes[v].kind;
-        if (kind === 'ambient') q.length += 0.61 * a;
+        // with the radiation model the open end carries its own inertance
+        if (kind === 'ambient') q.length += (p.fxEnds | 0) === 1 ? 0.61 * a : 0;
         else if ((kind === 'plenum' && !(q.kind === 'intake' && isRight)) || kind === 'muffler') q.length += 0.85 * a;
       }
     }

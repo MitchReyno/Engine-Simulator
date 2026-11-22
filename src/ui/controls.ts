@@ -8,7 +8,7 @@ type Updater = (value: number) => void;
 
 const FOUR_ONLY = [
   'valvesPerCyl', 'intakeValveSize', 'exhaustValveSize', 'camProfile', 'intakeLift', 'exhaustLift', 'intakeDuration', 'exhaustDuration',
-  'lsa', 'camAdvance', 'firingOrder', 'collector', 'plenumVolume', 'mechDetail',
+  'lsa', 'camAdvance', 'firingOrder', 'collector', 'plenumVolume', 'mechDetail', 'catalyst', 'mufflerType', 'headerSpread', 'rearSplit', 'fuelCut',
   'vtec', 'vtecRpm', 'lowIntakeLift', 'lowExhaustLift', 'lowIntakeDuration', 'lowExhaustDuration', 'vtc', 'vtcRange',
 ];
 const VTEC_ROWS = ['vtecRpm', 'lowIntakeLift', 'lowExhaustLift', 'lowIntakeDuration', 'lowExhaustDuration'];

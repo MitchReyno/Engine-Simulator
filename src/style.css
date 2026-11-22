@@ -173,3 +173,27 @@ dialog form { text-align: right; }
 @media (prefers-reduced-motion: reduce) {
   input.switch::after { transition: none; }
 }
+
+/* Driving mode */
+#viewdrive { position: absolute; inset: 0; }
+#viewdrive canvas { display: block; }
+#hud { position: absolute; inset: 0; pointer-events: none; font-family: var(--mono); color: #fff; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8); }
+#hud-laps { position: absolute; left: 14px; top: 12px; display: grid; gap: 2px; font-size: 13px; background: rgba(10, 13, 16, 0.55); padding: 8px 12px; border-radius: 6px; }
+#hud-laps .k { display: inline-block; width: 44px; color: #b8c2cc; font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; }
+#hud-lap { font-size: 18px; }
+#hud-map { position: absolute; right: 56px; top: 12px; background: rgba(10, 13, 16, 0.55); border-radius: 6px; }
+#hud-dash { position: absolute; left: 50%; bottom: 40px; transform: translateX(-50%); width: min(420px, 60%); background: rgba(10, 13, 16, 0.6); padding: 8px 14px 10px; border-radius: 8px; }
+#hud-revs { height: 10px; background: rgba(255, 255, 255, 0.14); border-radius: 5px; overflow: hidden; }
+#hud-rev-fill { height: 100%; width: 0; background: #6fd08c; }
+#hud-rev-fill.high { background: var(--amber); }
+#hud-rev-fill.shift { background: var(--danger); }
+#hud-row { display: flex; align-items: center; gap: 16px; margin-top: 6px; }
+#hud-gear { font-size: 40px; font-weight: 700; width: 44px; text-align: center; color: var(--amber); }
+#hud-speed b { font-size: 40px; font-weight: 600; }
+#hud-speed span { margin-left: 6px; font-size: 12px; color: #b8c2cc; }
+#hud-aids { margin-left: auto; display: grid; gap: 2px; font-size: 10px; letter-spacing: 0.1em; text-align: right; }
+#hud-aids span { opacity: 0.18; }
+#hud-aids span.on { opacity: 1; color: var(--amber); }
+#hud-aids #hud-off.on { color: var(--danger); }
+#hud-keys { position: absolute; left: 14px; right: 60px; bottom: 12px; font-size: 10.5px; text-shadow: none; color: #dfe6ec; }
+#stage.driving #view3d, #stage.driving #legend, #stage.driving #hint, #stage.driving #partlabel, #stage.driving #timebar { display: none; }

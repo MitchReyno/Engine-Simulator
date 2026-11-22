@@ -99,27 +99,23 @@ describe('whole-engine behaviour', () => {
   });
 
   it('lengthening the exhaust lowers its resonant peak', () => {
-    const peakBand = (L: number) => {
+    // quarter-wave resonance of the hot open header: about 275 Hz at 500 mm, 137 Hz at 1000 mm
+    const highOverLow = (L: number) => {
       const sim = new EngineSim(SR, { ...presetParams('thumper'), collector: 3, headerLength: L, throttle: 35, load: 100 });
       sim.run(6);
       const mag = spectrum(record(sim, N, (s) => s.lastEx).x);
-      let best = 0, bestF = 0;
-      for (let f = 60; f < 600; f += 25) {
-        let s = 0;
-        for (let i = Math.round(f / BIN); i < (f + 25) / BIN; i++) s += mag[i] * mag[i];
-        if (s > best) { best = s; bestF = f + 12.5; }
-      }
-      return bestF;
+      const band = (f0: number, f1: number) => { let p = 0; for (let i = Math.round(f0 / BIN); i < f1 / BIN; i++) p += mag[i] * mag[i]; return p; };
+      return band(235, 310) / band(110, 185);
     };
-    const short = peakBand(500), long = peakBand(1000);
-    expect(long).toBeLessThan(short);
-    expect(long / short).toBeGreaterThan(0.3);
-    expect(long / short).toBeLessThan(0.75);
+    const short = highOverLow(500), long = highOverLow(1000);
+    expect(short).toBeGreaterThan(4 * long);
+    expect(long).toBeLessThan(0.2);
   });
 
   it('cross-plane and flat-plane V8s sound different: only the cross-plane has quarter-order content', () => {
     const quarterOrders = (crank: number) => {
-      const sim = new EngineSim(SR, { ...presetParams('v8cross'), crank, throttle: 100, load: 100 });
+      // identical cylinders and no turbulence: what is left is the crank layout alone
+      const sim = new EngineSim(SR, { ...presetParams('v8cross'), crank, throttle: 100, load: 100, fxVar: 0, fxTurb: 0 });
       sim.run(6);
       const { x, rpm } = record(sim, N, (s) => s.lastEx);
       const mag = spectrum(x);
@@ -217,7 +213,8 @@ describe('sample rates', () => {
 
 describe('sound output', () => {
   it('has no solver-rate tones: content above 5 kHz is far below the engine note', () => {
-    const sim = new EngineSim(SR, presetParams('i4'));
+    // turbulence is broadband by design, so it is off for this check of the solver itself
+    const sim = new EngineSim(SR, { ...presetParams('i4'), fxTurb: 0 });
     sim.run(3);
     sim.setParams({ throttle: 100, load: 60 });
     sim.run(3);
@@ -340,20 +337,147 @@ describe('model fidelity options', () => {
     expect(b.headerWallT).toBeGreaterThan(idleWall + 15);
   });
 
-  it('afterfire burns unburned charge in the exhaust when the spark is cut at speed', () => {
-    const hottest = (fxAfterfire: number) => {
-      const sim = new EngineSim(SR, { ...presetParams('i4'), fxAfterfire, throttle: 100 });
-      sim.run(5);
-      let t = 0;
-      for (let i = 0; i < SR; i++) {
-        if (i % 128 === 0) sim.beginBlock();
-        sim.step();
-        if (i % 16 === 0) for (const k of sim.topo.headerPipe) { const j = sim.gas.pOff[k] + 3; t = Math.max(t, sim.gas.cp[j] / (sim.gas.rho[j] * 287)); }
+  it('afterfire: separate pops on the limiter, none in normal running, and no roar', () => {
+    const sim = new EngineSim(SR, { ...presetParams('i4'), fxAfterfire: 1 });
+    const pops = () => sim.gas.pops;
+    sim.run(5);
+    // a pop while cranking is fair; steady running must have none
+    const started = pops();
+    sim.setParams({ throttle: 100, load: 60 });
+    sim.run(4);
+    expect(pops() - started).toBe(0);
+    sim.setParams({ load: 0 });
+    sim.run(2);
+    // count 20 ms windows that contain an ignition: pops must be sparse events, not continuous burning
+    const before = pops();
+    let busy = 0, peak = 0;
+    for (let w = 0; w < 150; w++) {
+      const p0 = pops();
+      for (let i = 0; i < 960; i++) { if (i % 128 === 0) sim.beginBlock(); sim.step(); peak = Math.max(peak, Math.abs(sim.lastEx)); }
+      if (pops() > p0) busy++;
+    }
+    expect(pops() - before).toBeGreaterThan(3);
+    expect(busy).toBeLessThan(60);
+    // a pop is louder than the engine note but not a solver blow-up
+    expect(peak).toBeLessThan(40);
+    expect(sim.resets).toBe(0);
+  });
+
+  it('an open end reflects long waves almost fully and short waves less, only with the radiation model', async () => {
+    const { GasNetwork, P_ATM } = await import('../src/sim/gas');
+    const reflected = (sigma: number, radiation: boolean) => {
+      const n = 150, dx = 0.02;
+      const g = new GasNetwork([{ volume: 1, fixed: true }], [{ length: n * dx, diameter: 0.07, cells: n, volL: -1, volR: 0, wallT: 298 }]);
+      if (radiation) g.setRadiation(0, false, true);
+      const rho0 = P_ATM / (287 * 298), c = Math.sqrt(1.35 * 287 * 298);
+      // a right-travelling pressure pulse in the middle of the pipe
+      for (let i = 0; i < n; i++) {
+        const dp = 200 * Math.exp(-(((i + 0.5) * dx - 1.5) ** 2) / (2 * sigma * sigma));
+        g.setCell(i, rho0 + dp / (c * c), dp / (rho0 * c), P_ATM + dp, 0);
       }
-      expect(sim.resets).toBe(0);
-      return t;
+      const steps = Math.round(3 / c / (1 / SR));
+      for (let k = 0; k < steps; k++) g.step(1 / SR, 0);
+      let e = 0;
+      for (let i = 0; i < n; i++) e += (g.cp[i] - P_ATM) ** 2;
+      return e;
     };
-    expect(hottest(1)).toBeGreaterThan(hottest(0) + 100);
+    for (const sigma of [0.5, 0.05]) {
+      const ratio = reflected(sigma, true) / reflected(sigma, false);
+      // theory for an unflanged end: about (ka)^2 of the energy radiates, 10 % at 1 kHz in a 70 mm pipe
+      if (sigma > 0.1) expect(ratio).toBeGreaterThan(0.985);
+      else { expect(ratio).toBeLessThan(0.93); expect(ratio).toBeGreaterThan(0.8); }
+    }
+  });
+
+  it('turbulence adds broadband noise that grows with flow and stays well under the engine note', () => {
+    const floor = (fxTurb: number, throttle: number, load: number) => {
+      // identical cylinders, so the only noise between the orders is the turbulence
+      const sim = new EngineSim(SR, { ...presetParams('i4'), fxTurb, fxVar: 0 });
+      sim.run(3);
+      sim.setParams({ throttle, load });
+      sim.run(3);
+      const { x, rpm } = record(sim, 65536, (s) => s.lastEx);
+      const mag = spectrum(x), half = rpm / 120;
+      let noise = 0, count = 0, tone = 0;
+      // bins half-way between engine orders hold only noise
+      for (let k = Math.ceil(500 / half); (k + 0.5) * half < 3000; k++) { noise += mag[Math.round(((k + 0.5) * half) / BIN)] ** 2; count++; }
+      for (let i = 1; i < 3000 / BIN; i++) tone += mag[i] ** 2;
+      expect(sim.resets).toBe(0);
+      return { noise: noise / count, total: (noise / count) * (2500 / BIN), tone };
+    };
+    const off = floor(0, 100, 60), on = floor(1, 100, 60), idle = floor(1, 0, 0);
+    expect(on.noise).toBeGreaterThan(off.noise * 1000);
+    expect(on.noise).toBeGreaterThan(idle.noise * 100);
+    expect(10 * Math.log10(on.total / on.tone)).toBeLessThan(-15);
+  });
+
+  it('makes no click where the tailpipe flow reverses at low revs', () => {
+    const sim = new EngineSim(SR, { ...presetParams('k24'), fxTurb: 0, fxVar: 0 });
+    sim.run(4);
+    sim.setParams({ throttle: 6 });
+    sim.run(4);
+    const tail = sim.topo.pipes.findIndex((q) => q.kind === 'tail');
+    let reversals = 0, d1 = 0, d2 = 0, m1 = 0, a = 0, b = 0;
+    for (let i = 0; i < 9600; i++) {
+      if (i % 128 === 0) sim.beginBlock();
+      sim.step();
+      const m = sim.gas.pMdotR[tail];
+      if (i > 0 && m * m1 < 0) reversals++;
+      m1 = m;
+      // a kink in the flow is a step in the radiated pressure: compare its second difference with its first
+      const c = sim.lastEx;
+      if (i > 1) { d1 += (c - b) ** 2; d2 += (c - 2 * b + a) ** 2; }
+      a = b;
+      b = c;
+    }
+    expect(reversals).toBeGreaterThan(5);
+    expect(d2 / d1).toBeLessThan(0.02);
+  });
+
+  it('overrun fuel cut: no stray firing on a closed throttle, and a clean return to idle', () => {
+    const run = (fuelCut: number) => {
+      const sim = new EngineSim(SR, { ...presetParams('k24'), fuelCut });
+      const s = sim as unknown as { burning: Uint8Array };
+      sim.run(3);
+      sim.setParams({ throttle: 30 });
+      sim.run(2);
+      expect(sim.rpm).toBeGreaterThan(5500);
+      sim.setParams({ throttle: 0 });
+      sim.run(0.4);
+      // count ignitions while coasting down from high revs to just above the resume speed
+      let fires = 0, was = 0;
+      while (sim.rpm > 1600) {
+        sim.beginBlock();
+        for (let i = 0; i < 128; i++) { sim.step(); if (s.burning[0] && !was) fires++; was = s.burning[0]; }
+      }
+      sim.run(4);
+      expect(sim.resets).toBe(0);
+      expect(Math.abs(sim.rpmAvg - 750)).toBeLessThan(80);
+      return fires;
+    };
+    expect(run(1)).toBe(0);
+    // without it the starved charge fires now and then: the "Geiger counter"
+    expect(run(0)).toBeGreaterThan(3);
+  });
+
+  it('is louder under load than free-revving at the same speed', () => {
+    const loaded = new EngineSim(SR, presetParams('i4'));
+    loaded.run(3);
+    loaded.setParams({ throttle: 100, load: 60 });
+    loaded.run(4);
+    let best = { d: Infinity, spl: 0 };
+    for (const throttle of [5, 7, 9, 12]) {
+      const free = new EngineSim(SR, presetParams('i4'));
+      free.run(3);
+      free.setParams({ throttle });
+      free.run(5);
+      const d = Math.abs(free.rpmAvg - loaded.rpmAvg);
+      if (d < best.d) best = { d, spl: free.spl };
+    }
+    expect(best.d).toBeLessThan(0.25 * loaded.rpmAvg);
+    expect(loaded.spl).toBeGreaterThan(best.spl + 3);
+    expect(loaded.spl).toBeGreaterThan(75);
+    expect(loaded.spl).toBeLessThan(115);
   });
 });
 

@@ -111,9 +111,39 @@ Neither changes the sound by a rule. The change in note at the VTEC crossover co
 events feeding the same pipe solver. Oil pressure is not simulated; the map and the switching speed stand in
 for the ECU.
 
-### Honda K24A2 preset and the detailed 3D model
+### Driving mode
 
-The K24A2 preset (Acura TSX) uses published dimensions where I could find them and estimates elsewhere:
+The "Drive" button puts the configured engine in a car on a 2.1 km circuit. Every engine slider stays live.
+
+The car is stepped inside the audio thread, once per sample, next to the engine (`src/sim/vehicle.ts`):
+
+- **Clutch:** a friction clutch, T = clamp(k·(ω_engine − ω_gearbox), ±capacity·engagement). That torque replaces the
+  dyno brake in the crank equation, so engine speed is set by the car, not by a rule.
+- **Gearbox and wheels:** six ratios plus reverse and a final drive; one lumped wheel per axle with its own inertia;
+  front, rear or all-wheel drive.
+- **Tyres:** slip ratio and slip angle normalised by their peak values and combined, with force
+  μ·F_z·sin(1.35·atan(2.318·s)): a peak at s = 1 falling to 85 % when fully sliding. Grass has 55 % of the grip
+  and more rolling resistance.
+- **Chassis:** planar single-track model (forward speed, side speed, yaw) with longitudinal weight transfer,
+  aerodynamic drag and rolling resistance.
+- **Aids** (each can be switched off): automatic clutch, automatic gear changes, ABS and traction control.
+- **Lap timing** in simulation time, with three sector gates so a lap cannot be shortcut.
+
+Controls: W/S or the arrow keys for throttle and brake, A/D to steer, E/Q to change gear, C for the clutch
+pedal, R to return to the track, G for the grid, V to change camera, Enter for the starter. A gamepad works
+too (left stick, triggers, shoulder buttons). Key steering is limited to what the tyres can use at the
+current speed, because a key is all-or-nothing.
+
+Each preset carries a car: the K24 gets a 1500 kg front-drive saloon with the TSX six-speed ratios, the V8s
+and sixes get rear-drive cars, and the small engines get very light ones.
+
+Simplifications: one tyre per axle, no suspension or lateral weight transfer, no downforce, an ideal
+differential, a flat track with no walls, and a 3 % to 5 % rear grip bias that stands in for chassis tuning so
+the car pushes wide before it spins. Tyre squeal, wind and grass rumble are shaped noise, labelled as faked.
+
+### Honda K24 preset and the detailed 3D model
+
+The K24 preset (2004 Accord Euro CL9; the same engine as the Acura TSX's K24A2) uses published dimensions where I could find them and estimates elsewhere:
 
 | Value | Used | Source |
 | --- | --- | --- |
@@ -126,7 +156,8 @@ The K24A2 preset (Acura TSX) uses published dimensions where I could find them a
 | VTEC engagement, limiter | 6000 rpm, 7100 rpm | Published |
 | VTC range | 50° | Published |
 | Throttle body | 60 mm | Published (2004–2005) |
-| Runners, plenum, exhaust | see preset | Estimates; the stock 4-2-1 manifold is modelled as 4-into-1 |
+| Runners, plenum | see preset | Estimates |
+| Exhaust | 4-2-1, catalyst, Y-split to twin mufflers | Layout as on the car; lengths and volumes fitted to a recording (see Calibration) |
 
 "3D mechanical detail" (Engine panel) switches the view from schematic parts to a DOHC roller-rocker engine:
 toothed sprockets and a moving timing chain with guides and tensioner, the VTC phaser with its vanes visibly
@@ -206,14 +237,36 @@ modelled, approximated, faked or left out. Defaults are the higher setting excep
 | Cylinder gas properties | Constant γ = 1.35, combustion heat × 0.75 (approximated) | c_v = 650 + 0.2 T J/kg·K, giving γ from 1.40 cold to about 1.25 at 2500 K; heat × 0.9 (modelled) |
 | Reciprocating inertia | Ignored | (I + Σ m s′²) ω̇ = T − Σ m s′ s″ ω², with piston and rod mass from the bore (modelled) |
 | Ring blow-by | Perfect seal | Choked/unchoked orifice of about 0.2 mm² to the crankcase (modelled) |
-| Pipe open ends | Ideal pressure release (approximated) | Length corrections: 0.61 radius in free air, 0.85 radius into a volume (modelled) |
+| Pipe open ends | Ideal pressure release, or fixed length corrections of 0.61 radius in free air and 0.85 radius into a volume (approximated) | Radiation impedance at ends open to the air: an inertance 0.61 radius long in parallel with a resistance of 1.5 ρc, solved implicitly with the pipe's outgoing wave. About (ka)² of the incident energy radiates instead of reflecting (modelled) |
+| Flow turbulence | Off | Valve flow area flickers by 2 % rms (band-limited noise), which travels down the pipes; jet noise at each outlet from Lighthill's U⁸ law at 0.3 of the free-jet pressure. Both levels are set against a recording (approximated) |
+| Cylinder and cycle variation | Identical cylinders and cycles | Random heat release and burn duration each cycle, fixed offset per cylinder (approximated) |
 | Pipe wall temperature | Fixed per pipe (approximated) | Lumped thermal mass per pipe, heated by the gas, cooled by convection and radiation (modelled) |
 | Listening space | Free field (approximated) | Hard-ground reflection as an image source per outlet (modelled) |
-| Exhaust afterfire | Off | Fresh charge above 800 K in an exhaust pipe burns over 1.5 ms (approximated) |
+| Exhaust afterfire | Off | A cell with more than 60 % unburned charge ignites at random at a rate 10⁶·exp(−12000/T) per second, T being the hottest gas touching it; the flame spreads to neighbouring cells at 25 m/s and each burns over 2 ms, releasing 40 % of the charge's heating value (approximated) |
 | Mechanical noise | Off | Filtered cylinder pressure and valve-tick noise (faked) |
 
 With temperature-dependent gas, compression, combustion and expansion use c_v(T); flow through the valves still
 uses the pipes' constant-γ enthalpy, so the two models meet at equal temperature and pressure, not equal energy.
+
+Afterfire gives separate pops: on the inline-4 held on the limiter, about 7 per second, each a few dB above
+the engine note, and none in normal running, at idle or on a two-stroke's short-circuited charge (which is too
+diluted to light). The earlier version burned any fresh gas above 800 K at once, which made a continuous roar.
+
+Overrun fuel cut (Running panel, on by default for four-strokes) stops fuel with the throttle closed more
+than 700 rpm above idle and restores it 350 rpm above idle, as an injection ECU does. Without it a closed
+throttle leaves a small, heavily diluted charge that ignites on some cycles and not others, which sounds like
+a Geiger counter.
+
+Two details of the pipe ends matter at light throttle, where flow at the tailpipe reverses every pulse:
+the mouth re-ingests the gas it has just expelled (a "puff" that disperses over 30 ms) before drawing in
+outside air, and orifice flow at valves and the throttle is made linear below 150 Pa instead of following a
+square root through zero. Without them every reversal put a corner in the sound wave, heard as clicks.
+
+The header material (Exhaust panel) is steel tube or cast iron. Cast iron has a friction factor of 0.045
+against 0.02 and a thick wall, so it damps pipe waves more, takes more heat from the gas and warms up slowly.
+
+The status line shows the sound pressure level of exhaust plus intake at the listener in dB re 20 µPa. It is
+unweighted, so low-frequency boom counts in full.
 
 The intake mouth can be an open trumpet or carry a paper air filter, modelled as a linear flow resistance
 (Δp = 22 Pa per kg/m²s). The filter is what damps intake-pipe ringing when the throttle snaps shut.
@@ -228,7 +281,7 @@ burned-gas transport in every pipe; volumes for plenum, collectors and muffler; 
 radiation from the pipe mouths.
 
 **Approximated:** constant-γ gas in the pipes (and in the cylinders at the lower setting); perfect-mixing
-scavenging; idealised idle air and idle spark control; elliptic orifice law with fixed discharge coefficients; open ends without radiation loss; collectors as small volumes (they lose the dynamic head and ignore merge
+scavenging; idealised idle air and idle spark control; elliptic orifice law with fixed discharge coefficients; open-end radiation as a two-element (resistance and inertance) fit; turbulence as noise scaled by flow; collectors as small volumes (they lose the dynamic head and ignore merge
 angles); the muffler as a single expansion chamber; textbook correlations for wall heat, pipe friction and engine
 friction; empirical burn-duration and misfire curves versus mixture and residual gas; fuel mass not added to the
 gas; idealised idle valve and rev limiter; a polynomial cam profile.
@@ -240,7 +293,7 @@ to real solver cells but drawn lengths are compressed.
 
 ## Verification
 
-`npm test` runs 52 tests. Beyond the unit tests of kinematics, firing orders and the gas solver, the whole-engine
+`npm test` runs 64 tests; one needs the recording and is skipped without it. Beyond the unit tests of kinematics, firing orders and the gas solver, the whole-engine
 tests check the points the model has to get right:
 
 | Check | Result |
@@ -249,6 +302,13 @@ tests check the points the model has to get right:
 | Longer exhaust lowers the resonance | Single with open header: strongest band moves from about 225 Hz at 500 mm to about 100 Hz at 1000 mm |
 | Cross-plane vs flat-plane V8 | Same engine, same pipes: quarter-order content is within a few dB of the firing line for the cross-plane and about −78 dB for the flat-plane |
 | K24 variable valvetrain | At full throttle near 4000 rpm the cam phaser adds more than 8 % torque (measured 247 vs 208 N·m); near 6500–6900 rpm the high lobes add more than 15 % power (measured 177 vs 133 kW) |
+| Driving: grip | Peak lateral acceleration within 8 % of the tyre grip setting for front, rear and all-wheel drive; the front slides first |
+| Driving: K24 car | 0–100 km/h in 7.5 s (the real TSX: about 7.5 s), braking at about 0.9 g, no creep or stall when stopped in gear |
+| Driving: lap | A robot driver (pure pursuit, 80 % of grip) laps in about 78–81 s without leaving the track |
+| Open-end reflection | A long pulse reflects with over 98.5 % of the energy it has with an ideal end; a short one (content to about 1 kHz, 70 mm pipe) with about 90 %, as theory predicts |
+| Louder under load | Inline-4 at the same speed: more than 3 dB louder at full throttle against a load than free-revving |
+| Afterfire | No ignitions in normal running; separate pops on the limiter, in fewer than 40 % of 20 ms windows |
+| Turbulence | Noise between the engine orders rises more than 30 dB with the model on, more than 20 dB from idle to full load, and stays more than 15 dB under the note |
 | Idle | All presets start and settle near their idle target with manifold vacuum |
 | Redline | Limiter holds the inline-4 within a few percent of 7000 rpm |
 | Full load | Inline-4 with default fidelity: about 195–220 N·m (97–110 N·m/L) between 3000 and 5000 rpm, VE about 1.0–1.1, peak pressure about 63 bar, peak temperature about 2750 K |
@@ -259,6 +319,35 @@ tests check the points the model has to get right:
 | Tapered pipes | Gas at rest stays at rest; mass and energy conserved to round-off |
 | Fidelity options | Every option in every position idles, makes plausible torque and reaches the limiter with no reset |
 | No solver tones | Exhaust and intake content above 5 kHz is more than 35 dB below the engine note |
+
+## Calibration against a recording
+
+`scripts/compare.ts` compares the simulator with a recording of a real engine. It tracks engine speed in the
+recording from its harmonic comb, reads the level of each engine order (multiples of crank speed) and the noise
+floor between them, and does the same to the simulator held at the same speeds at full throttle. Levels are
+relative to the firing order, so no microphone calibration is needed.
+
+```
+npx vite-node scripts/compare-run.ts '{}' '{"catalyst":0}'   # table per rpm bin and a score for each variant
+npx vite-node scripts/render.ts                               # writes a simulated pull to samples/ as WAV and PNG
+```
+
+Against a near-exhaust recording of a K24 pulled to 7700 rpm (not in the repository), the mean error over
+orders 1 to 8 and the noise floor went from 15 dB to about 5.5 dB. What the recording showed, and what changed:
+
+| Recording | Simulator before | Change |
+| --- | --- | --- |
+| Noise floor 40–55 dB under the firing order, falling about 8 dB per octave above 2.4 kHz | 20–40 dB under and white: turbulence far too loud and too hissy | Jet noise scaled to 0.3 of the free-jet law with a second low-pass at 2.4 kHz; valve flicker halved to 2 %. The noise between orders now matches within 3 dB per octave from 300 Hz to 19 kHz |
+| Orders 1, 1.5, 3, 5 present at −10 to −40 dB | Absent: all cylinders and cycles identical | Cycle-to-cycle scatter of heat release (2 %) and burn duration (3 %), growing slightly with residual gas; a fixed ±5 % spread between cylinders; a header length spread slider |
+| Orders 4, 6, 8 at −15 to −25 dB | 10–15 dB stronger, with sharp pipe resonances | Catalytic converter (a volume with a laminar flow resistance) and a muffler type with outlet resistance |
+
+The K24 preset follows the 2004 Accord Euro (CL9) exhaust layout: a 4-2-1 manifold, catalytic converter, one
+centre pipe and a Y-split to twin rear mufflers and tailpipes ("Rear section" in the Exhaust panel). Its
+dimensions (420 mm primaries with 20 % spread, 1.8 m from collector to mufflers, 12 L of muffler in total,
+250 mm tailpipes of 45 mm) come from a coordinate search over plausible values against that recording; with
+this layout the error is 5.6 dB. The recorded car's real exhaust is unknown, so those numbers are a fit, not a measurement, and the
+remaining 5 dB is within what an unknown microphone position and exhaust could explain. The match is on
+spectra at full throttle between 4000 and 7700 rpm only.
 
 ## Performance and what was reduced
 
@@ -284,7 +373,8 @@ the status line); cell sizes are chosen so this should not happen in normal runn
   idle is rough.
 - Applying two-stroke mode to a four-stroke preset works but leaves exhaust and intake dimensions untuned.
 - Mufflers pass more low-frequency pulse energy than real ones, and open headers are far too clean, because there
-  is no flow noise, no wall radiation and no absorptive loss.
+  is no wall radiation and no absorptive loss, and the turbulence model is a scaling law that has not been
+  compared with a recording.
 - High-frequency rasp is limited by pipe resolution (see above).
 - A collector here cannot model tuned merge collectors or anti-reversion steps.
 - The idle controller can hunt with very large valve overlap, much as a real engine lopes.

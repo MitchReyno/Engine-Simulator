@@ -40,7 +40,7 @@ const tog = (key: string, label: string, group: string, def: number, hint?: stri
 
 export const COLLECTOR_LABELS = ['All into one', 'Paired / per-bank into one', 'True dual', 'Open headers'];
 
-export const GROUPS = ['Engine', 'Valves & ports', 'Intake', 'Exhaust', 'Combustion', 'Running', 'Audio', 'Model fidelity'];
+export const GROUPS = ['Engine', 'Valves & ports', 'Intake', 'Exhaust', 'Combustion', 'Running', 'Car', 'Audio', 'Model fidelity'];
 
 export const PARAM_DEFS: ParamDef[] = [
   // Engine. layout / cylinders / crank / firingOrder options are filled in by the UI.
@@ -98,11 +98,17 @@ export const PARAM_DEFS: ParamDef[] = [
   s('plenumVolume', 'Plenum volume', 'L', 'Intake', 0.5, 12, 0.1, 3),
 
   s('headerLength', 'Header length', 'mm', 'Exhaust', 150, 1500, 5, 500),
+  s('headerSpread', 'Header length spread', '%', 'Exhaust', 0, 40, 1, 0, 'Makes the outer cylinders\' pipes longer than the inner ones, as in a compact or cast manifold. Unequal pipes give a rougher note with more low orders.'),
   s('headerDiameter', 'Header Ø', 'mm', 'Exhaust', 22, 65, 0.5, 38),
   s('chamberDiameter', 'Chamber belly Ø', 'mm', 'Exhaust', 50, 160, 1, 110, 'Two-stroke expansion chamber: widest diameter.'),
   tog('chamberSilencer', 'Stinger silencer', 'Exhaust', 1, 'Two-stroke: a small silencer volume after the stinger.'),
+  sel('manifold', 'Header material', 'Exhaust', ['Steel tube', 'Cast iron'], 0, 'Cast iron is rough inside (more friction and heat transfer) and thick, so it heats up slowly.'),
   sel('collector', 'Collector type', 'Exhaust', COLLECTOR_LABELS, 0),
-  s('midLength', 'Collector pipe length', 'mm', 'Exhaust', 200, 2000, 10, 700, 'Collector to muffler.'),
+  s('midLength', 'Collector pipe length', 'mm', 'Exhaust', 200, 3000, 10, 700, 'Collector to muffler.'),
+  sel('rearSplit', 'Rear section', 'Exhaust', ['Single muffler and tailpipe', 'Y-split to twin mufflers and tailpipes'], 0,
+    'With "All into one" or "Paired" collectors: one pipe runs back and splits to a muffler and tailpipe on each side. Muffler volume is the total of both; tailpipe diameter is per pipe.'),
+  sel('catalyst', 'Catalytic converter', 'Exhaust', ['None', 'Fitted'], 0, 'A honeycomb brick in a can, a third of the way to the muffler. It resists flow and takes the edge off the pressure pulses.'),
+  sel('mufflerType', 'Muffler type', 'Exhaust', ['Empty chamber', 'Straight-through (perforated core)', 'Baffled'], 0, 'How hard it is for gas to leave the muffler. More resistance quietens the upper harmonics and costs some power.'),
   s('mufflerVolume', 'Muffler volume', 'L', 'Exhaust', 0.5, 40, 0.5, 12),
   s('tailLength', 'Tailpipe length', 'mm', 'Exhaust', 200, 3000, 10, 900),
   s('tailDiameter', 'Tailpipe Ø', 'mm', 'Exhaust', 25, 100, 1, 50),
@@ -116,11 +122,31 @@ export const PARAM_DEFS: ParamDef[] = [
   s('idleRpm', 'Idle target', 'rpm', 'Running', 500, 2000, 10, 900, 'Idle air valve setpoint when the throttle is closed.', false),
   s('revLimit', 'Rev limiter', 'rpm', 'Running', 2000, 13000, 100, 7000, 'Hard spark cut.', false),
   tog('ignition', 'Ignition', 'Running', 1),
+  tog('fuelCut', 'Overrun fuel cut', 'Running', 1, 'Four-stroke. Fuel injection shuts off with the throttle closed above idle, so the engine coasts down silently and picks up cleanly. Off behaves like a carburettor: a starved, diluted charge that fires irregularly.'),
+
+  s('carMass', 'Car mass', 'kg', 'Car', 150, 2500, 10, 1500, 'With driver and fuel.'),
+  sel('drivetrain', 'Driven wheels', 'Car', ['Front', 'Rear', 'All four'], 0, 'Also sets weight distribution: 60 % front for front-drive, 50 % for rear-drive, 56 % for all-wheel drive.'),
+  s('finalDrive', 'Final drive', ':1', 'Car', 2, 7, 0.01, 4.76),
+  s('gear1', '1st gear', ':1', 'Car', 1.5, 4.5, 0.01, 3.27),
+  s('gear2', '2nd gear', ':1', 'Car', 1, 3, 0.01, 1.88),
+  s('gear3', '3rd gear', ':1', 'Car', 0.8, 2.2, 0.01, 1.36),
+  s('gear4', '4th gear', ':1', 'Car', 0.6, 1.8, 0.01, 1.03),
+  s('gear5', '5th gear', ':1', 'Car', 0.5, 1.5, 0.01, 0.83),
+  s('gear6', '6th gear', ':1', 'Car', 0.4, 1.3, 0.01, 0.66),
+  s('tyreDiameter', 'Tyre diameter', 'mm', 'Car', 450, 750, 5, 640),
+  s('tyreGrip', 'Tyre grip', 'μ', 'Car', 0.6, 1.8, 0.01, 1.05, 'Peak friction coefficient on asphalt. Road tyres are about 1.0, slicks 1.5.'),
+  s('dragArea', 'Drag area (Cd·A)', 'm²', 'Car', 0.25, 1.2, 0.01, 0.62),
+  s('brakeForce', 'Brake strength', 'g', 'Car', 0.5, 2, 0.05, 1.3, 'Deceleration the brakes could give at full pedal if the tyres held.'),
+  tog('autoShift', 'Automatic gear changes', 'Car', 1),
+  tog('autoClutch', 'Automatic clutch', 'Car', 1, 'Slips the clutch to pull away, opens it before a stall and during shifts. Off: hold C for the clutch pedal.'),
+  tog('abs', 'Anti-lock brakes', 'Car', 1),
+  tog('tc', 'Traction control', 'Car', 1),
 
   s('volume', 'Master volume', '%', 'Audio', 0, 100, 1, 70),
   s('mixExhaust', 'Exhaust', '%', 'Audio', 0, 100, 1, 100),
   s('mixIntake', 'Intake', '%', 'Audio', 0, 100, 1, 100),
   s('mixMech', 'Mechanical (faked)', '%', 'Audio', 0, 100, 1, 35),
+  s('mixCar', 'Tyres and wind (faked)', '%', 'Audio', 0, 100, 1, 60, 'Driving mode only.'),
   s('listenerPos', 'Listener position', 'm', 'Audio', -1, 5, 0.1, 3, '0 = intake mouth at the front, 3.5 = tailpipe exit.'),
   s('listenerDist', 'Listener distance', 'm', 'Audio', 0.5, 10, 0.1, 1.5, 'Sideways distance from the car centreline.'),
 
@@ -130,20 +156,24 @@ export const PARAM_DEFS: ParamDef[] = [
     'The mass of pistons and rods exchanges energy with the crank every stroke and reshapes the torque at high rpm.'),
   fx('fxBlowby', 'Ring blow-by', ['Perfect seal', 'Ring-gap leak'], ['off', 'modelled'], 1,
     'A small orifice from each cylinder to the crankcase. It matters most at cranking and idle speeds.'),
-  fx('fxEnds', 'Pipe open ends', ['Ideal open end', 'End-corrected'], ['approximated', 'modelled'], 1,
-    'The air just outside an open end moves with the wave, making each pipe acoustically 0.6 to 0.85 radii longer.'),
+  fx('fxEnds', 'Pipe open ends', ['Ideal open end', 'End-corrected', 'Radiation impedance'], ['approximated', 'approximated', 'modelled'], 2,
+    'The air just outside an open end moves with the wave, making the pipe acoustically longer. The radiation model also lets high frequencies leave instead of reflecting, so upper pipe resonances ring less.'),
+  fx('fxTurb', 'Flow turbulence', ['Off', 'Turbulence model'], ['off', 'approximated'], 1,
+    'Random fluctuation of the flow through the valves, which travels down the pipes as broadband noise, plus jet noise at the pipe exits. Amplitudes come from scaling laws; the waveform is noise.'),
   fx('fxWalls', 'Pipe wall temperature', ['Fixed', 'Thermal model'], ['approximated', 'modelled'], 1,
     'Walls have heat capacity: headers heat up under load and cool at idle, which shifts the sound speed and the tuning.'),
   fx('fxGround', 'Listening space', ['Free field', 'Ground reflection'], ['approximated', 'modelled'], 1,
     'Adds the reflection from hard ground as an image source, which comb-filters the sound with distance.'),
+  fx('fxVar', 'Cylinder and cycle variation', ['Identical', 'Varying'], ['off', 'approximated'], 1,
+    'No two cylinders or cycles burn alike. Each cycle gets a slightly different burn rate and heat release, and each cylinder a small fixed offset. This is what gives a real engine sound between its firing harmonics.'),
   fx('fxAfterfire', 'Exhaust afterfire', ['Off', 'Ignition model'], ['off', 'approximated'], 0,
-    'Unburned charge that reaches hot exhaust gas ignites in the pipe: pops on the limiter and on spark cut.'),
+    'A pocket of unburned charge in the exhaust can ignite where it meets hot gas, then burns as a flame travelling along the pipe: separate pops on the limiter and after a spark cut, not a continuous burn.'),
   fx('fxMech', 'Mechanical noise', ['Off', 'Filtered noise'], ['off', 'faked'], 1,
     'Not simulated: band-passed cylinder pressure and noise bursts at valve closing.'),
 ];
 
 /** Not shown as sliders; driven by dedicated controls. */
-export const HIDDEN_DEFAULTS: Params = { starter: 0, timeScale: 1, paused: 0, cellBudget: 140 };
+export const HIDDEN_DEFAULTS: Params = { starter: 0, timeScale: 1, paused: 0, cellBudget: 140, drive: 0, steer: 0, brake: 0, clutch: 0 };
 
 export const PARAM_BY_KEY: Record<string, ParamDef> = Object.fromEntries(PARAM_DEFS.map((d) => [d.key, d]));
 
@@ -166,14 +196,16 @@ export const PRESETS: Preset[] = [
     values: {},
   },
   {
-    id: 'k24', name: 'Honda K24A2 2.4 L i-VTEC', blurb: 'Acura TSX engine: VTEC on both cams at 6000 rpm, intake cam phaser, roller rockers, chain drive.',
+    id: 'k24', name: 'Honda K24 2.4 L i-VTEC (Accord Euro CL9)', blurb: 'VTEC on both cams at 6000 rpm, intake cam phaser, 4-2-1 manifold, one pipe splitting to twin mufflers and tailpipes.',
     values: {
       layout: 1, cylinders: 4, crank: 0, firingOrder: 0, bore: 87, stroke: 99, rodLength: 152, compression: 10.5, flywheel: 0.14, mechDetail: 1,
       valvesPerCyl: 1, intakeValveSize: 40, exhaustValveSize: 34, camProfile: 2,
       intakeLift: 11.5, exhaustLift: 11.5, intakeDuration: 268, exhaustDuration: 262, lsa: 118, camAdvance: -10,
       vtec: 1, vtecRpm: 6000, lowIntakeLift: 8, lowExhaustLift: 7.2, lowIntakeDuration: 226, lowExhaustDuration: 222, vtc: 1, vtcRange: 50,
       throttleBody: 60, intakeLength: 350, runnerLength: 330, runnerDiameter: 46, plenumVolume: 3.5,
-      headerLength: 450, headerDiameter: 40, collector: 0, midLength: 1500, mufflerVolume: 16, tailLength: 800, tailDiameter: 55,
+      // exhaust dimensions fitted to a near-exhaust recording, see scripts/compare.ts
+      // layout as on the car: 4-2-1 manifold, catalyst, one centre pipe, Y-split to twin rear mufflers
+      headerLength: 420, headerSpread: 20, headerDiameter: 40, collector: 1, catalyst: 1, midLength: 1800, rearSplit: 1, mufflerType: 1, mufflerVolume: 12, tailLength: 250, tailDiameter: 45,
       idleRpm: 750, revLimit: 7100,
     },
   },
@@ -185,6 +217,7 @@ export const PRESETS: Preset[] = [
       throttleBody: 42, intakeLength: 180, runnerLength: 220, runnerDiameter: 40, plenumVolume: 1.5,
       headerLength: 650, headerDiameter: 40, collector: 0, midLength: 300, mufflerVolume: 3, tailLength: 300, tailDiameter: 38,
       idleRpm: 1300, revLimit: 7500, ignitionAdvance: 18,
+      carMass: 380, drivetrain: 1, dragArea: 0.5, finalDrive: 4.2,
     },
   },
   {
@@ -195,6 +228,7 @@ export const PRESETS: Preset[] = [
       throttleBody: 85, intakeLength: 350, runnerLength: 280, runnerDiameter: 46, plenumVolume: 7,
       headerLength: 650, headerDiameter: 44, collector: 2, midLength: 900, mufflerVolume: 14, tailLength: 1000, tailDiameter: 60,
       idleRpm: 800, revLimit: 6400, ignitionAdvance: 19, burnDuration: 56,
+      carMass: 1700, drivetrain: 1, finalDrive: 3.42, gear1: 2.66, gear2: 1.78, gear3: 1.3, gear4: 1, gear5: 0.74, gear6: 0.5, tyreDiameter: 680, dragArea: 0.7,
     },
   },
   {
@@ -205,6 +239,7 @@ export const PRESETS: Preset[] = [
       throttleBody: 85, intakeLength: 250, runnerLength: 240, runnerDiameter: 46, plenumVolume: 8,
       headerLength: 480, headerDiameter: 42, collector: 2, midLength: 600, mufflerVolume: 8, tailLength: 600, tailDiameter: 63,
       idleRpm: 1200, revLimit: 9000, ignitionAdvance: 16, burnDuration: 48,
+      carMass: 1480, drivetrain: 1, finalDrive: 4.4, gear1: 3.08, gear2: 2.19, gear3: 1.63, gear4: 1.29, gear5: 1.03, gear6: 0.84, tyreDiameter: 690, tyreGrip: 1.25,
     },
   },
   {
@@ -215,6 +250,7 @@ export const PRESETS: Preset[] = [
       throttleBody: 76, intakeLength: 300, runnerLength: 300, runnerDiameter: 44, plenumVolume: 6,
       headerLength: 520, headerDiameter: 42, collector: 1, midLength: 500, mufflerVolume: 14, tailLength: 500, tailDiameter: 60,
       idleRpm: 850, revLimit: 7800, ignitionAdvance: 18,
+      carMass: 1450, drivetrain: 1, finalDrive: 3.44, gear1: 3.82, gear2: 2.2, gear3: 1.52, gear4: 1.22, gear5: 1.02, gear6: 0.84, tyreDiameter: 680, tyreGrip: 1.2,
     },
   },
   {
@@ -225,6 +261,7 @@ export const PRESETS: Preset[] = [
       throttleBody: 46, intakeLength: 150, runnerLength: 160, runnerDiameter: 44, plenumVolume: 1,
       headerLength: 800, headerDiameter: 44, collector: 2, midLength: 300, mufflerVolume: 3, tailLength: 400, tailDiameter: 44,
       idleRpm: 950, revLimit: 5800, ignitionAdvance: 21, burnDuration: 60,
+      carMass: 480, drivetrain: 1, finalDrive: 3.2, dragArea: 0.55,
     },
   },
   {
@@ -234,6 +271,7 @@ export const PRESETS: Preset[] = [
       throttleBody: 70, runnerLength: 360, runnerDiameter: 38, plenumVolume: 5,
       headerLength: 450, headerDiameter: 38, collector: 1, midLength: 800, mufflerVolume: 16, tailLength: 900, tailDiameter: 57,
       idleRpm: 750, revLimit: 7000,
+      carMass: 1550, drivetrain: 1, finalDrive: 3.46, gear1: 4.11, gear2: 2.32, gear3: 1.54, gear4: 1.18, gear5: 1, gear6: 0.85,
     },
   },
   {
@@ -244,6 +282,7 @@ export const PRESETS: Preset[] = [
       throttleBody: 36, intakeLength: 150, runnerLength: 100, runnerDiameter: 36,
       headerLength: 1000, headerDiameter: 40, chamberDiameter: 110, midLength: 600, mufflerVolume: 1, tailLength: 300, tailDiameter: 25,
       afr: 12.5, ignitionAdvance: 18, burnDuration: 44, idleRpm: 1600, revLimit: 10000,
+      carMass: 190, drivetrain: 1, dragArea: 0.45, finalDrive: 5.2, tyreDiameter: 480, tyreGrip: 1.3,
     },
   },
   {
@@ -254,6 +293,7 @@ export const PRESETS: Preset[] = [
       throttleBody: 28, intakeLength: 130, runnerLength: 100, runnerDiameter: 30,
       headerLength: 820, headerDiameter: 36, chamberDiameter: 95, midLength: 500, mufflerVolume: 1.6, tailLength: 300, tailDiameter: 25,
       afr: 12.5, ignitionAdvance: 18, burnDuration: 42, idleRpm: 1500, revLimit: 9500,
+      carMass: 260, drivetrain: 1, dragArea: 0.45, finalDrive: 5.4, tyreDiameter: 520, tyreGrip: 1.25,
     },
   },
   {
@@ -264,6 +304,7 @@ export const PRESETS: Preset[] = [
       throttleBody: 30, intakeLength: 140, runnerLength: 100, runnerDiameter: 32,
       headerLength: 880, headerDiameter: 38, chamberDiameter: 100, midLength: 500, mufflerVolume: 2.4, tailLength: 300, tailDiameter: 25,
       afr: 12.5, ignitionAdvance: 18, burnDuration: 44, idleRpm: 1400, revLimit: 8500,
+      carMass: 340, drivetrain: 1, dragArea: 0.5, finalDrive: 4.6, tyreDiameter: 560, tyreGrip: 1.25,
     },
   },
 ];

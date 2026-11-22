@@ -16,6 +16,16 @@ export const CP = GAMMA * CV;
 export const P_ATM = 101325;
 export const T_ATM = 298;
 export const RHO_ATM = P_ATM / (R_GAS * T_ATM);
+const C_ATM = Math.sqrt(GAMMA * R_GAS * T_ATM);
+/** Turbulent flame speed of afterfire in a pipe, m/s. */
+const FLAME_SPEED = 25;
+/** Radiation resistance of an unflanged pipe end, in units of rho c. */
+const RAD_R = 1.5;
+/** How long expelled gas stays near a pipe mouth, s. */
+const PUFF_TAU = 0.03;
+/** Pressure difference below which orifice flow is made linear, Pa. */
+const P_SMOOTH = 150;
+const Z_RAD = RAD_R * RHO_ATM * C_ATM;
 
 /** Critical pressure ratio and choked flow-function value. */
 export const B_CRIT = Math.pow(2 / (GAMMA + 1), GAMMA / G1);
@@ -147,6 +157,13 @@ export class GasNetwork {
   private bp = 0;
   private bh = 0;
   private bY = 0;
+  /** Afterfire: per-cell flame timer, and a count of spontaneous ignitions. */
+  private flame!: Float32Array; private seed = 2463534242; pops = 0;
+  /** Gas recently expelled from each radiating end, per unit pipe area: mass, enthalpy, burned mass. */
+  private puffM!: Float64Array; private puffH!: Float64Array; private puffY!: Float64Array;
+  private puffDt = 0; private pRadLen = 0;
+  /** Open-end radiation: end-correction length (0 = off) and the velocity through the inertance. */
+  pRadL!: Float64Array; pRadR!: Float64Array; pRadUL!: Float64Array; pRadUR!: Float64Array;
   private br = 1;
 
   constructor(volumes: VolumeSpec[], pipes: PipeSpec[]) {
@@ -188,6 +205,13 @@ export class GasNetwork {
     this.pFr = new Float64Array(np);
     this.pMdotL = new Float64Array(np);
     this.pMdotR = new Float64Array(np);
+    this.pRadL = new Float64Array(np);
+    this.pRadR = new Float64Array(np);
+    this.pRadUL = new Float64Array(np);
+    this.pRadUR = new Float64Array(np);
+    this.puffM = new Float64Array(2 * np);
+    this.puffH = new Float64Array(2 * np);
+    this.puffY = new Float64Array(2 * np);
     let total = 0;
     let maxN = 0;
     for (let k = 0; k < np; k++) {
@@ -215,6 +239,7 @@ export class GasNetwork {
     this.aF = new Float64Array(total + np);
     for (let k = 0; k < np; k++) this.setPipeGeometry(k, pipes[k].length, pipes[k].diameter, pipes[k].profile);
     this.ci = new Float64Array(total);
+    this.flame = new Float32Array(total);
     this.eRl = new Float64Array(total);
     this.eUl = new Float64Array(total);
     this.ePl = new Float64Array(total);
@@ -286,6 +311,19 @@ export class GasNetwork {
     this.vG[v] = (p * PSI_STAR) / Math.sqrt(R_GAS * T);
   }
 
+  /**
+   * Radiation impedance at an open end: an inertance (the air just outside, 0.61 radii long)
+   * in parallel with a resistance of 1.5 rho c. Low frequencies reflect almost completely;
+   * high frequencies radiate away instead of feeding the pipe's upper resonances.
+   */
+  setRadiation(k: number, left: boolean, right: boolean): void {
+    const fo = this.pOff[k] + k;
+    this.pRadL[k] = left ? 0.6133 * Math.sqrt(this.aF[fo] / Math.PI) : 0;
+    this.pRadR[k] = right ? 0.6133 * Math.sqrt(this.aF[fo + this.pN[k]] / Math.PI) : 0;
+    if (!left) this.pRadUL[k] = 0;
+    if (!right) this.pRadUR[k] = 0;
+  }
+
   pipeMass(k: number): number {
     let s = 0;
     const off = this.pOff[k];
@@ -305,7 +343,7 @@ export class GasNetwork {
    * direction (into the pipe). Sets bm (inward mass flux per pipe area), bp
    * (face pressure), bh (specific total enthalpy carried), bY and br.
    */
-  private bc(v: number, phi: number, rc: number, wc: number, pc: number, cc: number, Yc: number, dpv: number): void {
+  private bc(v: number, phi: number, rc: number, wc: number, pc: number, cc: number, Yc: number, dpv: number, z0 = 0, zu = 0, pe = 0): void {
     const mc = rc * wc;
     // Outgoing characteristic, linearised about the cell: p_f = pStar + cc * m_f.
     // The linearisation fails near sonic inflow, so pStar is floored.
@@ -320,6 +358,55 @@ export class GasNetwork {
       return;
     }
     const pv = this.vp[v] + dpv;
+    if (z0 > 0) {
+      // Radiating open end: the pressure just outside is p_v + z0 (u - uL), with u the outward
+      // velocity at the face. Solved together with the characteristic, so it is implicit in the flow.
+      const q = pStar - pv + zu;
+      if (q >= 0) {
+        let m = q / (cc + z0 / rc);
+        const wpos = wc < 0 ? -wc : 0;
+        const mMax = wpos >= cc ? rc * wpos : rc * (0.34 * cc + 0.66 * wpos);
+        if (m > mMax) m = mMax;
+        this.bm = -m;
+        this.bp = pStar - cc * m;
+        this.bh = (GAMMA / G1) * (pc / rc) + 0.5 * wc * wc;
+        this.bY = Yc;
+        this.br = rc;
+        // what leaves hangs just outside the mouth for a moment
+        const dm = m * this.puffDt;
+        this.puffM[pe] += dm;
+        this.puffH[pe] += dm * this.bh;
+        this.puffY[pe] += dm * Yc;
+      } else {
+        // Inflow accelerates from rest outside: static face pressure is lower by the dynamic head.
+        // The gas drawn in is first the puff that just left, then outside air: when the flow only
+        // sloshes in and out, the same hot gas returns and nothing jumps at the reversal.
+        const pm = this.puffM[pe];
+        const w = pm / (pm + rc * this.pRadLen);
+        const Tv = pm > 1e-12 ? w * (this.puffH[pe] / (pm * CP)) + (1 - w) * this.vT[v] : this.vT[v];
+        // outside air drawn into an exhaust pipe carries no fuel, so it counts as inert there
+        const Ya = this.pReact[pe >> 1] ? 1 : this.vY[v];
+        const Yv = pm > 1e-12 ? w * (this.puffY[pe] / pm) + (1 - w) * Ya : Ya;
+        const rv = pv / (R_GAS * Tv);
+        // same radiation term as the outflow branch, so the flow has no kink where it reverses
+        const ce = cc + z0 / rc;
+        let m = (-2 * q) / (ce + Math.sqrt(ce * ce - (2 * q) / rv));
+        if (m > this.vG[v]) m = this.vG[v];
+        this.bm = m;
+        this.bp = pStar + cc * m;
+        this.bh = CP * Tv;
+        this.bY = Yv;
+        this.br = rv;
+        if (pm > 1e-12) {
+          let k = 1 - (w * m * this.puffDt) / pm;
+          if (k < 0) k = 0;
+          this.puffM[pe] = pm * k;
+          this.puffH[pe] *= k;
+          this.puffY[pe] *= k;
+        }
+      }
+      return;
+    }
     if (pStar < pv) {
       // Volume -> pipe: upstream stagnation is the volume.
       const g = dpv === 0 ? phi * this.vG[v] : (phi * this.vG[v] * pv) / this.vp[v];
@@ -334,6 +421,10 @@ export class GasNetwork {
         m = (g * (Math.sqrt(disc) - alpha * bg)) / (1 + bg * bg);
         if (m < 0) m = 0;
       }
+      // An orifice law goes as the square root of the pressure difference, which has a cusp where the
+      // flow reverses. Real flow has inertia there; make it linear below a few hundred pascals.
+      // (only at a real restriction: an open end must stay transparent to small waves)
+      if (phi < 0.9995) m *= Math.sqrt((pv - pStar) / (pv - pStar + P_SMOOTH));
       const pf = pStar + cc * m;
       const Tv = this.vT[v];
       this.bm = m;
@@ -369,6 +460,7 @@ export class GasNetwork {
           m = pStar / cc;
         }
       }
+      if (invG2 > 0) m *= Math.sqrt((pStar - pv) / (pStar - pv + P_SMOOTH));
       // Sonic limit of the pipe end itself (simple-wave estimate).
       const wpos = wo > 0 ? wo : 0;
       const mMax = wpos >= cc ? rc * wpos : rc * (0.34 * cc + 0.66 * wpos);
@@ -392,6 +484,14 @@ export class GasNetwork {
     const { eRl, eUl, ePl, eRr, eUr, ePr, f0, f1, f2, f3 } = this;
     const { vdm, vdE, vdmY, iaC, aF } = this;
     let maxRate = 0;
+    // puffs outside the open ends disperse over a few hundredths of a second
+    this.puffDt = dt;
+    const fade = 1 - dt / PUFF_TAU;
+    for (let e = 0; e < this.puffM.length; e++) {
+      this.puffM[e] *= fade;
+      this.puffH[e] *= fade;
+      this.puffY[e] *= fade;
+    }
 
     for (let k = 0; k < this.np; k++) {
       const off = this.pOff[k];
@@ -465,8 +565,12 @@ export class GasNetwork {
       // Left boundary.
       let v = this.pVolL[k];
       // a filter's pressure drop uses last step's flux (stable while resistance << c)
-      this.bc(v, this.pPhiL[k], rho[off], cu[off], cp[off], cc[off], cY[off], (-this.pResL[k] * this.pMdotL[k]) / areaL);
+      let dpv = (-this.pResL[k] * this.pMdotL[k]) / areaL;
+      let rad = this.pRadL[k];
+      this.pRadLen = rad;
+      this.bc(v, this.pPhiL[k], rho[off], cu[off], cp[off], cc[off], cY[off], dpv, rad > 0 ? Z_RAD : 0, Z_RAD * this.pRadUL[k], 2 * k);
       let m = this.bm;
+      if (rad > 0) this.pRadUL[k] += (-m / rho[off] - this.pRadUL[k]) * (1 - Math.exp((-dt * C_ATM * RAD_R) / rad));
       f0[0] = m;
       f1[0] = this.bp + (m * m) / this.br;
       f2[0] = m * this.bh;
@@ -480,8 +584,12 @@ export class GasNetwork {
       }
       // Right boundary.
       v = this.pVolR[k];
-      this.bc(v, this.pPhiR[k], rho[jl], -cu[jl], cp[jl], cc[jl], cY[jl], (this.pResR[k] * this.pMdotR[k]) / areaR);
+      dpv = (this.pResR[k] * this.pMdotR[k]) / areaR;
+      rad = this.pRadR[k];
+      this.pRadLen = rad;
+      this.bc(v, this.pPhiR[k], rho[jl], -cu[jl], cp[jl], cc[jl], cY[jl], dpv, rad > 0 ? Z_RAD : 0, Z_RAD * this.pRadUR[k], 2 * k + 1);
       m = this.bm;
+      if (rad > 0) this.pRadUR[k] += (-m / rho[jl] - this.pRadUR[k]) * (1 - Math.exp((-dt * C_ATM * RAD_R) / rad));
       f0[n] = -m;
       f1[n] = this.bp + (m * m) / this.br;
       f2[n] = -m * this.bh;
@@ -525,7 +633,9 @@ export class GasNetwork {
       const kh = (4 / diam) * (fr / 8) * GAMMA * srcDt;
       const rtw = R_GAS * this.pTw[k];
       const react = this.pReact[k] === 1 && this.reactQ > 0;
-      const kReact = Math.min(1, srcDt / 1.5e-3);
+      const kReact = Math.min(1, srcDt / 2e-3);
+      const kFade = srcDt / 6e-3;
+      const flame = this.flame;
       let qGas = 0;
       for (let i = 0; i < n; i++) {
         const j = off + i;
@@ -550,12 +660,33 @@ export class GasNetwork {
           e += de;
           qGas += de;
           if (react) {
-            // Afterfire: fresh charge above its ignition temperature burns over ~1.5 ms.
+            // Afterfire. A pocket of unburned charge ignites at random, at a rate set by the hottest
+            // gas touching it; the flame then spreads cell to cell at a turbulent flame speed.
             const fresh = r - y;
-            if (p * iv > 800 * R_GAS && fresh > 0.25 * r) {
+            const fl = flame[j];
+            if (fl > 0) {
               const db = fresh * kReact;
               y += db;
               e += db * this.reactQ;
+              flame[j] = fl > kFade ? fl - kFade : 0;
+            } else if (fresh > 0.5 * r) {
+              const lit = (i > 0 && flame[j - 1] > 0) || (i < n - 1 && flame[j + 1] > 0);
+              let rate = lit ? FLAME_SPEED / dx : 0;
+              // Too diluted to light by itself below 60 % fresh charge.
+              if (fresh > 0.6 * r) {
+                let c = cc[j];
+                if (i > 0 && cc[j - 1] > c) c = cc[j - 1];
+                if (i < n - 1 && cc[j + 1] > c) c = cc[j + 1];
+                const T = (c * c) / (GAMMA * R_GAS);
+                if (T > 750) rate += 1e6 * Math.exp(-12000 / T);
+              }
+              if (rate > 0) {
+                this.seed = (Math.imul(this.seed, 1664525) + 1013904223) | 0;
+                if ((this.seed >>> 8) < rate * srcDt * 16777216) {
+                  flame[j] = 1;
+                  if (!lit) this.pops++;
+                }
+              }
             }
           }
         }

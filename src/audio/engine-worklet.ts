@@ -28,6 +28,8 @@ class EngineProcessor extends AudioWorkletProcessor {
   private overloadBlocks = 0;
   private busyMs = 0;
   private busyBlocks = 0;
+  private rec: Float32Array | null = null;
+  private recPos = 0;
 
   constructor(options: { processorOptions: { params: Params } }) {
     super();
@@ -39,6 +41,9 @@ class EngineProcessor extends AudioWorkletProcessor {
       else if (m.type === 'recycle') this.pool.push(m.buffer);
       else if (m.type === 'step') this.sim.requestStepDegrees(m.degrees);
       else if (m.type === 'autostart') this.sim.autoStart = true;
+      else if (m.type === 'shift') this.sim.car.shift(m.dir, this.sim.cur.autoClutch > 0.5);
+      else if (m.type === 'carReset') this.sim.car.reset(!!m.grid);
+      else if (m.type === 'record') { this.rec = new Float32Array(Math.round(m.seconds * sampleRate)); this.recPos = 0; }
     };
   }
 
@@ -51,6 +56,16 @@ class EngineProcessor extends AudioWorkletProcessor {
     sim.beginBlock(n);
     for (let i = 0; i < n; i++) ch0[i] = sim.step();
     for (let c = 1; c < out.length; c++) out[c].set(ch0);
+    if (this.rec) {
+      // capture exactly what is played, for diagnosing a sound outside the browser
+      const take = Math.min(n, this.rec.length - this.recPos);
+      this.rec.set(ch0.subarray(0, take), this.recPos);
+      this.recPos += take;
+      if (this.recPos >= this.rec.length) {
+        this.port.postMessage({ type: 'recording', buffer: this.rec.buffer }, [this.rec.buffer]);
+        this.rec = null;
+      }
+    }
     this.busyMs += now() - t0;
 
     // CPU load, averaged over ~0.25 s so a coarse clock still resolves it.

@@ -75,6 +75,9 @@ export class EngineAudio {
     } else if (m.type === 'topology') {
       this.topology = m.info;
       this.onTopology(m.info);
+    } else if (m.type === 'recording') {
+      this.onRecording?.(new Float32Array(m.buffer));
+      this.onRecording = null;
     } else if (m.type === 'quality') {
       this.onQuality(m.cellBudget, m.load);
     }
@@ -89,6 +92,24 @@ export class EngineAudio {
 
   stepDegrees(degrees: number): void {
     this.node?.port.postMessage({ type: 'step', degrees });
+  }
+
+  private onRecording: ((x: Float32Array) => void) | null = null;
+
+  /** Capture the next few seconds of output exactly as played (before the volume control). */
+  record(seconds: number): Promise<Float32Array> {
+    return new Promise((resolve) => {
+      this.onRecording = resolve;
+      this.node?.port.postMessage({ type: 'record', seconds });
+    });
+  }
+
+  shift(dir: number): void {
+    this.node?.port.postMessage({ type: 'shift', dir });
+  }
+
+  resetCar(grid: boolean): void {
+    this.node?.port.postMessage({ type: 'carReset', grid });
   }
 
   autoStart(): void {

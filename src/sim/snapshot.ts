@@ -1,6 +1,6 @@
 // Layout of the Float32Array state snapshot posted from the audio thread.
 
-export const SNAP_HEADER = 32;
+export const SNAP_HEADER = 64;
 export const SNAP_CYL_STRIDE = 10;
 export const SNAP_VOL_STRIDE = 3;
 export const TRACE_BINS = 720;
@@ -33,6 +33,32 @@ export const H = {
   vtc: 23,
   /** 1 when the rockers are locked to the high lobes. */
   vtec: 24,
+  // Car state, driving mode. Positions in metres on the track plane, heading anticlockwise from +x.
+  drive: 32,
+  carX: 33,
+  carY: 34,
+  carPsi: 35,
+  carVx: 36,
+  carVy: 37,
+  carYaw: 38,
+  carSteer: 39,
+  carGear: 40,
+  carRotF: 41,
+  carRotR: 42,
+  carSlipF: 43,
+  carSlipR: 44,
+  carGrass: 45,
+  lapTime: 46,
+  lastLap: 47,
+  bestLap: 48,
+  laps: 49,
+  carS: 50,
+  carClutch: 51,
+  carAx: 52,
+  carAy: 53,
+  carAids: 54,
+  /** Sound pressure level of exhaust plus intake at the listener, dB re 20 uPa. */
+  spl: 55,
 } as const;
 
 export const FLAG_STARTER = 1;

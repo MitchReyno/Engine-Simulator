@@ -62,6 +62,7 @@ export const PART_INFO: Record<string, { title: string; text: string }> = {
   header: { title: 'Exhaust header', text: '1D pipe from the exhaust valve. The blowdown pulse reflects from the collector as a suction wave; length sets when it returns.' },
   collector: { title: 'Collector', text: 'Small junction volume where headers merge. Pulses from one cylinder reach the others through it.' },
   midPipe: { title: 'Collector pipe', text: 'Carries merged flow from the collector to the muffler.' },
+  catalyst: { title: 'Catalytic converter', text: 'A ceramic honeycomb in a steel can. The gas crosses thousands of fine channels, so its pressure drop is proportional to flow; that resistance damps the pressure waves passing through. The chemistry is not simulated.' },
   muffler: { title: 'Muffler', text: 'An expansion chamber modelled as one volume. It acts as an acoustic low-pass; no absorptive packing or baffles are modelled.' },
   tailpipe: { title: 'Tailpipe', text: 'Open to the air. The rate of change of mass flow at its exit is the exhaust sound source.' },
 };

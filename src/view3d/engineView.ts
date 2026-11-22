@@ -91,7 +91,7 @@ interface VolRig {
 const GEOMETRY_KEYS = [
   'layout', 'cylinders', 'bankAngle', 'crank', 'firingOrder', 'bore', 'stroke', 'rodLength', 'compression',
   'throttleBody', 'intakeLength', 'runnerLength', 'runnerDiameter', 'plenumVolume', 'headerLength', 'headerDiameter',
-  'mechDetail', 'strokes', 'valvesPerCyl', 'intakeValveSize', 'exhaustValveSize', 'exhaustPortOpen', 'transferPortOpen', 'chamberDiameter', 'chamberSilencer', 'collector', 'midLength', 'mufflerVolume', 'tailLength', 'tailDiameter', 'cellBudget',
+  'rearSplit', 'catalyst', 'mufflerType', 'headerSpread', 'mechDetail', 'strokes', 'valvesPerCyl', 'intakeValveSize', 'exhaustValveSize', 'exhaustPortOpen', 'transferPortOpen', 'chamberDiameter', 'chamberSilencer', 'collector', 'midLength', 'mufflerVolume', 'tailLength', 'tailDiameter', 'cellBudget',
 ];
 
 /** Only the detailed view draws cam lobes to scale, so only it rebuilds for these. */
@@ -1018,10 +1018,12 @@ export class EngineView {
     const muffPos = new Map<number, { c: THREE.Vector3; len: number }>();
     const midLen = clamp(p.midLength * 1e-3, 0.2, 2) * 0.45;
     const collZ = zRear + 0.12 + 0.3 * Lh;
+    // room for the merge and the Y-split when one pipe feeds twin mufflers
+    const splitDraw = p.rearSplit > 0.5 && (p.collector | 0) < 2 ? 0.45 : 0;
     mufflers.forEach((m, k) => {
       const len = clamp(m.v.volume / (Math.PI * muffR * muffR), 0.1, 0.9);
       const x = mufflers.length > 1 ? (k === 0 ? 0.3 : -0.3) : kind === 'inline' || kind === 'single' ? ports[0].exhaust.x - 0.12 : 0;
-      muffPos.set(m.idx, { c: V(x, lowY - 0.06, collZ + midLen + 0.12 + len / 2), len });
+      muffPos.set(m.idx, { c: V(x, lowY - 0.06, collZ + midLen + splitDraw + 0.12 + len / 2), len });
     });
     const sideX = (i: number) => (kind === 'inline' || kind === 'single' ? ports[i].exhaust.x - 0.14 : ports[i].exhaust.x + Math.sign(ports[i].exhaust.x || 1) * 0.1);
     ports.forEach((q, i) => {
@@ -1049,16 +1051,49 @@ export class EngineView {
       const p3 = V(0.5 * (sideX(i) + end.x), end.y + 0.03, Math.min(end.z - 0.08, Math.max(z[i] + 0.15, end.z - 0.25)));
       addPipe(k, [q.exhaust, p1, p2, p3, end], 'exhaust', 'header');
     });
+    // Junctions with no header: where secondaries merge, and the Y-split ahead of twin mufflers.
+    const mids = topo.pipes.filter((x) => x.kind === 'mid');
+    topo.volumes.forEach((vol, idx) => {
+      if (vol.kind !== 'junction' || junctionPos.has(idx)) return;
+      const fed = mids.filter((x) => x.volL === idx && muffPos.has(x.volR)).map((x) => muffPos.get(x.volR)!);
+      if (fed.length) return;
+      const up = mids.filter((x) => x.volR === idx && junctionPos.has(x.volL)).map((x) => junctionPos.get(x.volL)!);
+      if (up.length) junctionPos.set(idx, V(up.reduce((s, q) => s + q.x, 0) / up.length, lowY - 0.01, collZ + 0.17));
+    });
+    topo.volumes.forEach((vol, idx) => {
+      if (vol.kind !== 'junction' || junctionPos.has(idx)) return;
+      const fed = mids.filter((x) => x.volL === idx && muffPos.has(x.volR)).map((x) => muffPos.get(x.volR)!);
+      if (fed.length) junctionPos.set(idx, V(fed.reduce((s, m) => s + m.c.x, 0) / fed.length, lowY - 0.04, Math.min(...fed.map((m) => m.c.z - m.len / 2)) - 0.3));
+    });
     for (const [vol, pos] of junctionPos) {
       const j = new THREE.Mesh(new THREE.SphereGeometry(clamp(Math.cbrt(topo.volumes[vol].volume) * 0.62, 0.03, 0.08), 20, 14), volMat());
       j.position.copy(pos);
       addVol(vol, j, 'exhaust', 'collector');
     }
+    // A catalytic converter sits part-way along the collector pipe, splitting it in two.
+    const catPos = new Map<number, THREE.Vector3>();
+    const catLen = 0.16, catR = 0.062;
+    topo.volumes.forEach((vol, idx) => {
+      if (vol.kind !== 'catalyst') return;
+      const before = topo.pipes.find((x) => x.kind === 'mid' && x.volR === idx)!, after = topo.pipes.find((x) => x.kind === 'mid' && x.volL === idx)!;
+      const a = junctionPos.get(before.volL)!, mp = muffPos.get(after.volR);
+      const c = a.clone().lerp(mp ? V(mp.c.x, mp.c.y, mp.c.z - mp.len / 2 - muffR * 0.6) : junctionPos.get(after.volR)!, 0.38);
+      catPos.set(idx, c);
+      const can = new THREE.Mesh(new THREE.CapsuleGeometry(catR, catLen, 6, 20), volMat());
+      can.rotation.x = Math.PI / 2;
+      can.position.copy(c);
+      addVol(idx, can, 'exhaust', 'catalyst');
+    });
+    const midEnd = (vol: number, inlet: boolean) => {
+      const c = catPos.get(vol);
+      if (c) return c.clone().add(V(0, 0, (inlet ? -1 : 1) * (catLen / 2 + catR * 0.6)));
+      const mp = muffPos.get(vol);
+      return mp ? V(mp.c.x, mp.c.y, mp.c.z - mp.len / 2 - muffR * 0.6) : junctionPos.get(vol)!.clone();
+    };
     topo.pipes.forEach((q, k) => {
       if (q.kind === 'mid') {
-        const a = junctionPos.get(q.volL)!;
-        const mp = muffPos.get(q.volR)!;
-        const b = V(mp.c.x, mp.c.y, mp.c.z - mp.len / 2 - muffR * 0.6);
+        const a = midEnd(q.volL, false);
+        const b = midEnd(q.volR, true);
         addPipe(k, [a, a.clone().lerp(b, 0.5).add(V(0, -0.01, 0)), b], 'exhaust', 'midPipe');
       } else if (q.kind === 'tail') {
         const mp = muffPos.get(q.volL)!;
