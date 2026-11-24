@@ -3,6 +3,8 @@
 export const SNAP_HEADER = 64;
 export const SNAP_CYL_STRIDE = 10;
 export const SNAP_VOL_STRIDE = 3;
+/** Per pipe cell: pressure, temperature, velocity, burned fraction, afterfire brightness. */
+export const SNAP_CELL_FIELDS = 5;
 export const TRACE_BINS = 720;
 
 export const H = {
@@ -59,6 +61,13 @@ export const H = {
   carAids: 54,
   /** Sound pressure level of exhaust plus intake at the listener, dB re 20 uPa. */
   spl: 55,
+  /** Forced induction: charge pressure above atmospheric (Pa), compressor speed (rpm), wastegate opening 0..1. */
+  boost: 56,
+  turboRpm: 57,
+  wastegate: 58,
+  /** Torque absorbed by the speed-holding dynamometer, N m, and crank speed averaged over the last cycle. */
+  dynoTorque: 59,
+  rpmAvg: 60,
 } as const;
 
 export const FLAG_STARTER = 1;
@@ -75,16 +84,17 @@ export const C = {
   Y: 4,
   liftIn: 5,
   liftEx: 6,
+  /** Combustion brightness: burn rate scaled by the size of the charge, peak since the last snapshot. */
   flash: 7,
   mdotIn: 8,
   mdotEx: 9,
 } as const;
 
 export function snapshotSize(nCyl: number, nVol: number, nCells: number): number {
-  return SNAP_HEADER + nCyl * SNAP_CYL_STRIDE + nVol * SNAP_VOL_STRIDE + nCells * 4 + nCyl * TRACE_BINS;
+  return SNAP_HEADER + nCyl * SNAP_CYL_STRIDE + nVol * SNAP_VOL_STRIDE + nCells * SNAP_CELL_FIELDS + nCyl * TRACE_BINS;
 }
 
-export const SNAP_MAX_FLOATS = snapshotSize(12, 32, 600);
+export const SNAP_MAX_FLOATS = snapshotSize(12, 32, 1200);
 
 /** Read-side helper. */
 export class SnapshotView {
@@ -103,5 +113,7 @@ export class SnapshotView {
   cellT(j: number): number { return this.a[this.cellBase + this.nCells + j]; }
   cellU(j: number): number { return this.a[this.cellBase + 2 * this.nCells + j]; }
   cellY(j: number): number { return this.a[this.cellBase + 3 * this.nCells + j]; }
-  get traceBase(): number { return this.cellBase + 4 * this.nCells; }
+  /** Afterfire burning in this cell, 0..1. */
+  cellFire(j: number): number { return this.a[this.cellBase + 4 * this.nCells + j]; }
+  get traceBase(): number { return this.cellBase + SNAP_CELL_FIELDS * this.nCells; }
 }

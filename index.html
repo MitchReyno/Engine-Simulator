@@ -19,9 +19,12 @@
           <button data-color="temperature">Temperature</button>
           <button data-color="gas">Fresh / burned</button>
         </div>
+        <button id="dyno" class="toggle" title="Run a dyno pull and plot torque, power and more against engine speed">Dyno</button>
         <button id="drive" class="toggle" title="Put this engine in a car and drive it round a circuit">Drive</button>
         <button id="cutaway" class="toggle">Cutaway</button>
         <button id="exploded" class="toggle">Exploded</button>
+        <button id="show-mic" title="Show the microphone. Click it in the 3D view and drag its arrows to move it.">Microphone</button>
+        <button id="settings" class="toggle" title="Audio mix, microphone position, car body and model fidelity. These are remembered in this browser.">Sim Settings</button>
         <button id="about">Model notes</button>
       </header>
 
@@ -48,7 +51,10 @@
               <div id="hud-keys" class="muted"><kbd>W</kbd>/<kbd>S</kbd> throttle, brake · <kbd>A</kbd>/<kbd>D</kbd> steer · <kbd>E</kbd>/<kbd>Q</kbd> gear up, down · <kbd>C</kbd> clutch · <kbd>R</kbd> back to track · <kbd>G</kbd> grid · <kbd>V</kbd> camera · gamepad supported</div>
             </div>
             <div id="legend"><div id="legend-bar"></div><div id="legend-labels"><span></span><span></span><span></span></div></div>
-            <div id="partlabel" hidden><b></b><p></p></div>
+            <button id="view-options" data-viz="view3d" title="View options: what the 3D view shows (pipe cells, sound paths, sources, body style, lens and more)" aria-label="View options">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 6h10M18 6h2M4 12h3M11 12h9M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>
+            </button>
+            <div id="partlabel" hidden><b></b><p></p><div id="part-params"></div><div id="mic-presets"></div></div>
             <div id="hint" class="muted">drag to orbit · scroll to zoom · click a part</div>
             <div id="timebar">
               <button id="pause" title="Pause (P)">❚❚</button>
@@ -84,12 +90,12 @@
           </div>
 
           <div id="instruments">
-            <figure><figcaption>Output waveform</figcaption><canvas id="c-scope"></canvas></figure>
-            <figure><figcaption>Spectrogram <span>firing harmonics marked</span></figcaption><canvas id="c-spec"></canvas></figure>
-            <figure><figcaption>P–V diagram <button id="pv-log" class="mini">log</button></figcaption><canvas id="c-pv"></canvas></figure>
-            <figure><figcaption>Cylinder pressure vs crank angle</figcaption><canvas id="c-ptheta"></canvas></figure>
-            <figure><figcaption>Tract pressure <span>intake → cylinder → exhaust, brown = burned gas</span></figcaption><canvas id="c-tract"></canvas></figure>
-            <figure><figcaption>Valve lift and timing</figcaption><canvas id="c-valves"></canvas></figure>
+            <figure><figcaption>Output waveform <button class="mini viz-btn" data-viz="scope" title="Display options for this plot" aria-label="Display options">⚙</button></figcaption><canvas id="c-scope"></canvas></figure>
+            <figure><figcaption>Spectrogram <span>firing harmonics marked</span> <button class="mini viz-btn" data-viz="spec" title="Display options for this plot" aria-label="Display options">⚙</button></figcaption><canvas id="c-spec"></canvas></figure>
+            <figure><figcaption>P–V diagram <button class="mini viz-btn" data-viz="pv" title="Display options for this plot" aria-label="Display options">⚙</button></figcaption><canvas id="c-pv"></canvas></figure>
+            <figure><figcaption>Cylinder pressure vs crank angle <button class="mini viz-btn" data-viz="ptheta" title="Display options for this plot" aria-label="Display options">⚙</button></figcaption><canvas id="c-ptheta"></canvas></figure>
+            <figure><figcaption>Tract pressure <span>intake → cylinder → exhaust, brown = burned gas</span> <button class="mini viz-btn" data-viz="tract" title="Display options for this plot" aria-label="Display options">⚙</button></figcaption><canvas id="c-tract"></canvas></figure>
+            <figure><figcaption>Valve lift and timing <button class="mini viz-btn" data-viz="valves" title="Display options for this plot" aria-label="Display options">⚙</button></figcaption><canvas id="c-valves"></canvas></figure>
           </div>
         </section>
 
@@ -97,6 +103,14 @@
       </main>
     </div>
 
+    <dialog id="dyno-dialog">
+      <div class="settings-head"><h2>Dynamometer</h2><span class="muted">runs are remembered in this browser</span><button id="dyno-close" aria-label="Close dyno">✕</button></div>
+      <div id="dyno-body"></div>
+    </dialog>
+    <dialog id="settings-dialog">
+      <div class="settings-head"><h2>Sim Settings</h2><span class="muted">remembered in this browser</span><button id="settings-defaults" title="Put audio and model fidelity settings back to their defaults">Restore defaults</button><button id="settings-close" aria-label="Close settings">✕</button></div>
+      <div id="settings-body"></div>
+    </dialog>
     <dialog id="about-dialog">
       <div id="about-body"></div>
       <form method="dialog"><button>Close</button></form>

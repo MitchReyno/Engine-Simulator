@@ -2,13 +2,15 @@
 // usage: vite-node scripts/render.ts   (PRESET=k24 FROM=4000 TO=7650 SECONDS=7 OUT=samples/sim.wav)
 import { EngineSim } from '../src/sim/engine';
 import { presetParams } from '../src/sim/params';
+import { aimMic } from '../tests/util';
 import { spectrogramPng, stft, writeWav } from './wav';
 
 const id = process.env.PRESET ?? 'k24';
 const from = Number(process.env.FROM ?? 4000), to = Number(process.env.TO ?? 7650), secs = Number(process.env.SECONDS ?? 7);
 const out = process.env.OUT ?? `samples/Simulated-${id}-Near-Exhaust.wav`;
 const sr = 44100;
-const sim = new EngineSim(sr, { ...presetParams(id), revLimit: Math.max(presetParams(id).revLimit, to + 500), listenerPos: 3.5, listenerDist: 1 });
+const sim = new EngineSim(sr, { ...presetParams(id), revLimit: Math.max(presetParams(id).revLimit, to + 500) });
+aimMic(sim, 'tail', 0.4, 0.6);
 sim.run(3);
 sim.setParams({ throttle: 100 });
 let load = 30;

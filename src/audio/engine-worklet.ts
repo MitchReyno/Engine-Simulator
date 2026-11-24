@@ -1,6 +1,7 @@
 // Audio thread: owns the simulation, renders one sim step per output sample,
 // and posts state snapshots in recycled transferable buffers.
 
+import { FINE_ABOVE } from '../sim/topology';
 import { EngineSim } from '../sim/engine';
 import { Params } from '../sim/params';
 import { SNAP_MAX_FLOATS } from '../sim/snapshot';
@@ -54,7 +55,12 @@ class EngineProcessor extends AudioWorkletProcessor {
     const sim = this.sim;
     const t0 = now();
     sim.beginBlock(n);
-    for (let i = 0; i < n; i++) ch0[i] = sim.step();
+    // a second, silent output carries the waveform for the display, which must not fade in slow motion
+    const mon = outputs[1]?.[0];
+    for (let i = 0; i < n; i++) {
+      ch0[i] = sim.step();
+      if (mon) mon[i] = sim.cur.paused ? 0 : sim.lastMonitor;
+    }
     for (let c = 1; c < out.length; c++) out[c].set(ch0);
     if (this.rec) {
       // capture exactly what is played, for diagnosing a sound outside the browser
@@ -80,7 +86,10 @@ class EngineProcessor extends AudioWorkletProcessor {
       else this.overloadBlocks = 0;
       const budget = sim.target.cellBudget;
       if (this.overloadBlocks >= 4 && budget > MIN_BUDGET) {
-        const next = Math.max(MIN_BUDGET, Math.round(budget * 0.75));
+        // Extra-fine cells (more than one solver step per sample) are trimmed a fifth at a time down to the most
+        // a single step can carry, so a machine that can afford some of them keeps those; then by quarters.
+        // above FINE_ABOVE the slider asks for extra-fine cells: back those off first, then trim what one step can carry
+        const next = budget > FINE_ABOVE ? Math.max(FINE_ABOVE, Math.round(budget * 0.85)) : Math.max(MIN_BUDGET, Math.round(Math.min(budget, sim.topo.singleStepCells) * 0.75));
         sim.setParams({ cellBudget: next });
         this.port.postMessage({ type: 'quality', cellBudget: next, load: this.load });
         this.overloadBlocks = 0;

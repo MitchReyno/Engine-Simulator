@@ -8,7 +8,9 @@ type Updater = (value: number) => void;
 
 const FOUR_ONLY = [
   'valvesPerCyl', 'intakeValveSize', 'exhaustValveSize', 'camProfile', 'intakeLift', 'exhaustLift', 'intakeDuration', 'exhaustDuration',
-  'lsa', 'camAdvance', 'firingOrder', 'collector', 'plenumVolume', 'mechDetail', 'catalyst', 'mufflerType', 'headerSpread', 'rearSplit', 'fuelCut',
+  'lsa', 'camAdvance', 'firingOrder', 'collector', 'plenumVolume', 'mechDetail', 'catalyst', 'mufflerType', 'headerSpread', 'rearSplit', 'fuelCut', 'valveLash', 'timingDrive',
+  'intakePipeRatio', 'runnerTaper', 'bellmouth', 'airbox', 'airboxVolume', 'snorkelLength', 'snorkelDiameter', 'boost', 'boostTarget', 'turboSize', 'intercooler', 'chargeVolume', 'bov',
+  'mechValve', 'mechRamp', 'mechInjector', 'mechDrive', 'mechDriveSpread',
   'vtec', 'vtecRpm', 'lowIntakeLift', 'lowExhaustLift', 'lowIntakeDuration', 'lowExhaustDuration', 'vtc', 'vtcRange',
 ];
 const VTEC_ROWS = ['vtecRpm', 'lowIntakeLift', 'lowExhaustLift', 'lowIntakeDuration', 'lowExhaustDuration'];
@@ -122,6 +124,26 @@ export class Controls {
     return row;
   }
 
+  private extras = new Map<string, HTMLElement>();
+  /** A second control for a parameter, to place elsewhere; it stays in step with the panel's own. */
+  extraRow(key: string): HTMLElement | null {
+    const d = PARAM_DEFS.find((x) => x.key === key);
+    if (!d) return null;
+    let row = this.extras.get(key);
+    if (!row) {
+      row = this.row(d, d.label);
+      this.extras.set(key, row);
+      this.set(key, this.params[key]);
+    }
+    return row;
+  }
+
+  /** False for rows that do not apply to the current engine (two-stroke ports on a four-stroke, and so on). */
+  applies(key: string): boolean {
+    const row = this.rows.get(key);
+    return !!row && row.style.display !== 'none';
+  }
+
   /** Push a value into every widget bound to the key. */
   set(key: string, value: number): void {
     for (const fn of this.updaters.get(key) ?? []) fn(value);
@@ -150,9 +172,19 @@ export class Controls {
     const res = resolveLayout(kind, p.cylinders | 0, p.bankAngle, p.crank | 0, p.firingOrder | 0, two);
     fill('firingOrder', res.orderLabels.map((l, i) => [l, i]), res.orderIndex);
     this.rows.get('bankAngle')!.style.display = kind === 'v' ? '' : 'none';
+    // per-source mechanical controls only mean something for the simulated version
+    (this.panels.get('Mechanical noise')!.parentElement as HTMLElement).style.display = (p.fxMech | 0) === 2 ? '' : 'none';
     // Show only the rows that exist on this kind of engine.
     for (const k of FOUR_ONLY) this.rows.get(k)!.style.display = two ? 'none' : '';
+    for (const k of ['overrunCut', 'overrunRetard', 'overrunAir', 'overrunRpm', 'overrunTime']) this.rows.get(k)!.style.display = two ? 'none' : '';
     for (const k of TWO_ONLY) this.rows.get(k)!.style.display = two ? '' : 'none';
+    if (!two) {
+      // rows that only mean something with the option that owns them
+      for (const k of ['airboxVolume', 'snorkelLength', 'snorkelDiameter']) this.rows.get(k)!.style.display = p.airbox > 0.5 ? '' : 'none';
+      for (const k of ['boostTarget', 'turboSize', 'intercooler', 'chargeVolume', 'bov']) this.rows.get(k)!.style.display = p.boost > 0.5 ? '' : 'none';
+    }
+    // sounds that exist only with forced induction
+    for (const k of ['mixWhine', 'mixBov', 'fxWhine', 'fxBov', 'mechTurbo']) this.rows.get(k)!.style.display = !two && p.boost > 0.5 ? '' : 'none';
     if (!two) {
       const vt = p.vtec | 0;
       for (const k of VTEC_ROWS) this.rows.get(k)!.style.display = vt === 0 || (vt === 2 && k.includes('Exhaust')) ? 'none' : '';

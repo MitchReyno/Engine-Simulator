@@ -10,6 +10,8 @@ export class EngineAudio {
   ctx: AudioContext | null = null;
   node: AudioWorkletNode | null = null;
   analyser: AnalyserNode | null = null;
+  /** Unfaded, pre-volume waveform for the oscilloscope. */
+  scope: AnalyserNode | null = null;
   private gain: GainNode | null = null;
 
   /** Latest state; null until the first snapshot arrives. */
@@ -36,8 +38,8 @@ export class EngineAudio {
     await ctx.audioWorklet.addModule(workletUrl);
     const node = new AudioWorkletNode(ctx, 'engine-processor', {
       numberOfInputs: 0,
-      numberOfOutputs: 1,
-      outputChannelCount: [2],
+      numberOfOutputs: 2,
+      outputChannelCount: [2, 1],
       processorOptions: { params },
     });
     node.port.onmessage = (e) => this.onMessage(e.data);
@@ -48,7 +50,16 @@ export class EngineAudio {
     analyser.smoothingTimeConstant = 0.5;
     analyser.minDecibels = -100;
     analyser.maxDecibels = -10;
-    node.connect(gain);
+    // the waveform display listens to its own feed, kept alive by a silent path to the output
+    const scope = ctx.createAnalyser();
+    scope.fftSize = 16384;
+    const hush = ctx.createGain();
+    hush.gain.value = 0;
+    node.connect(scope, 1);
+    scope.connect(hush);
+    hush.connect(ctx.destination);
+    this.scope = scope;
+    node.connect(gain, 0);
     gain.connect(analyser);
     analyser.connect(ctx.destination);
     this.ctx = ctx;

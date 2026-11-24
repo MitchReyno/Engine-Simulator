@@ -28,6 +28,8 @@ const P_SMOOTH = 150;
 const Z_RAD = RAD_R * RHO_ATM * C_ATM;
 
 /** Critical pressure ratio and choked flow-function value. */
+/** Speed added to the flow speed in wall friction, m/s: a linear loss of about 1.5 per second in a 40 mm pipe. */
+export const U_ACOUSTIC = 6;
 export const B_CRIT = Math.pow(2 / (GAMMA + 1), GAMMA / G1);
 export const PSI_STAR = Math.sqrt(GAMMA) * Math.pow(2 / (GAMMA + 1), (GAMMA + 1) / (2 * G1));
 
@@ -159,6 +161,8 @@ export class GasNetwork {
   private bY = 0;
   /** Afterfire: per-cell flame timer, and a count of spontaneous ignitions. */
   private flame!: Float32Array; private seed = 2463534242; pops = 0;
+  /** For display: how much fresh charge each lit cell held, and whether it lit since the last read. */
+  private fireAmp!: Float32Array; private fireNew!: Uint8Array;
   /** Gas recently expelled from each radiating end, per unit pipe area: mass, enthalpy, burned mass. */
   private puffM!: Float64Array; private puffH!: Float64Array; private puffY!: Float64Array;
   private puffDt = 0; private pRadLen = 0;
@@ -240,6 +244,8 @@ export class GasNetwork {
     for (let k = 0; k < np; k++) this.setPipeGeometry(k, pipes[k].length, pipes[k].diameter, pipes[k].profile);
     this.ci = new Float64Array(total);
     this.flame = new Float32Array(total);
+    this.fireAmp = new Float32Array(total);
+    this.fireNew = new Uint8Array(total);
     this.eRl = new Float64Array(total);
     this.eUl = new Float64Array(total);
     this.ePl = new Float64Array(total);
@@ -295,6 +301,18 @@ export class GasNetwork {
     this.vE[v] = m * CV * T;
     this.vmY[v] = m * Y;
     this.refreshVolume(v);
+  }
+
+  /**
+   * Afterfire brightness per cell for display, 0..1. A cell that lit since the last call reads at full
+   * strength however brief the flame, so a slow display never misses a pop.
+   */
+  readFire(out: Float32Array, o: number): void {
+    const { flame, fireAmp, fireNew } = this;
+    for (let j = 0; j < this.nCells; j++) {
+      out[o + j] = fireAmp[j] * (fireNew[j] ? 1 : flame[j]);
+      fireNew[j] = 0;
+    }
   }
 
   /** Recompute p, T, Y of a volume after its m / E / V were changed externally. */
@@ -654,7 +672,9 @@ export class GasNetwork {
           // bursts would put a tone at the burst rate into the radiated sound.
           const iv = 1 / r;
           const au = Math.abs(mo * iv);
-          mo *= 1 - Math.min(0.5, kf * au);
+          // Turbulent friction goes as speed squared, so by itself it would leave small oscillations in still
+          // gas undamped; real pipes also lose sound in the boundary layer at the wall. The floor stands in for that.
+          mo *= 1 - Math.min(0.5, kf * (au + U_ACOUSTIC));
           const p = G1 * (e - 0.5 * mo * mo * iv);
           const de = Math.min(0.5, kh * (au + 5)) * (r * rtw - p) * IG1;
           e += de;
@@ -684,6 +704,8 @@ export class GasNetwork {
                 this.seed = (Math.imul(this.seed, 1664525) + 1013904223) | 0;
                 if ((this.seed >>> 8) < rate * srcDt * 16777216) {
                   flame[j] = 1;
+                  this.fireAmp[j] = fresh / r;
+                  this.fireNew[j] = 1;
                   if (!lit) this.pops++;
                 }
               }

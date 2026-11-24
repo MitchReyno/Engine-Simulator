@@ -1,4 +1,5 @@
 import { EngineSim } from '../src/sim/engine';
+import { GROUND_Y } from '../src/sim/placement';
 
 /** In-place radix-2 FFT; returns magnitude spectrum of a Hann-windowed signal. */
 export function spectrum(x: Float32Array | Float64Array): Float64Array {
@@ -48,4 +49,14 @@ export function bandPower(mag: Float64Array, hz: number, binHz: number, halfWidt
   let s = 0;
   for (let i = Math.max(1, c - halfWidth); i <= c + halfWidth && i < mag.length; i++) s += mag[i] * mag[i];
   return s;
+}
+
+/**
+ * Put the microphone `dist` metres to the side of the engine (at its height), or outboard of the
+ * nearest tailpipe at standing height and `behind` metres past the outlets.
+ */
+export function aimMic(sim: EngineSim, at: 'engine' | 'tail', dist: number, behind = 0): void {
+  const pl = sim.placement!;
+  if (at === 'engine') sim.setParams({ micX: pl.engine[0] + dist, micY: pl.engine[1] - GROUND_Y, micZ: pl.engine[2] });
+  else sim.setParams({ micX: Math.max(...pl.outlets.map((o) => o[0])) + dist, micY: 1.2, micZ: Math.max(...pl.outlets.map((o) => o[2])) + behind });
 }

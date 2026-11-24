@@ -6,10 +6,16 @@ import { Params } from './params';
 /** Flow resistance of a catalyst brick: about 4 kPa at 100 kg/m2s. */
 export const CAT_RES = 40;
 /** Flow resistance leaving the muffler: an empty chamber, a perforated straight-through core, baffles. */
-export const MUFFLER_RES = [0, 12, 35];
+export const MUFFLER_RES = [0, 12, 35, 0];
+/** Muffler type that means the muffler has been cut out and replaced by pipe. */
+export const MUFFLER_DELETE = 3;
+/** Share of a runner's area that flows when its entry is a plain sharp-edged hole rather than a bellmouth. */
+export const SHARP_ENTRY = 0.82;
+/** Flow resistance of the air filter element, Pa per kg/m2s: none, paper, cotton gauze, oiled foam, clogged paper. */
+export const FILTER_RES = [0, 22, 9, 14, 70];
 
-export type PipeKind = 'intake' | 'runner' | 'transfer' | 'header' | 'mid' | 'tail';
-export type VolumeKind = 'ambient' | 'plenum' | 'cylinder' | 'crankcase' | 'junction' | 'muffler' | 'catalyst';
+export type PipeKind = 'intake' | 'snorkel' | 'charge' | 'runner' | 'transfer' | 'header' | 'mid' | 'tail';
+export type VolumeKind = 'ambient' | 'plenum' | 'cylinder' | 'crankcase' | 'junction' | 'muffler' | 'catalyst' | 'airbox' | 'compressor' | 'charge' | 'turbine';
 
 export interface TopoPipe {
   kind: PipeKind;
@@ -47,6 +53,14 @@ export interface Topology {
   intakePipe: number;
   /** Every pipe whose left end is an intake mouth open to the air. */
   intakePipes: number[];
+  /** Pipes with a throttle at their right end, and pipes with the air filter at their left end. */
+  throttlePipes: number[];
+  filterPipes: number[];
+  /**
+   * Forced induction: the compressor moves air from one volume to the other, and (turbo only)
+   * the turbine lets exhaust from one volume to the other. -1 where there is none.
+   */
+  boost: { compIn: number; charge: number; turbIn: number; turbOut: number };
   runnerPipe: number[];
   headerPipe: number[];
   /** Two-stroke only: transfer passage and crankcase volume per cylinder. */
@@ -54,6 +68,8 @@ export interface Topology {
   crankcase: number[];
   twoStroke: boolean;
   totalCells: number;
+  /** The most cells this network can have while the solver still takes one step per sample. */
+  singleStepCells: number;
 }
 
 export const VOL_AMBIENT = 0;
@@ -66,7 +82,8 @@ const area = (d: number) => 0.25 * Math.PI * d * d;
 export function buildTopology(p: Params, layout: ResolvedLayout, dt: number): Topology {
   if (p.strokes > 0.5) return buildTwoStroke(p, layout, dt);
   const n = layout.n;
-  const collector = n === 1 && p.collector === 1 ? 0 : p.collector | 0;
+  // a turbocharger needs all the exhaust in one place, so it overrides separate banks and open headers
+  const collector = (p.boost | 0) === 1 && (p.collector | 0) >= 2 ? 0 : n === 1 && p.collector === 1 ? 0 : p.collector | 0;
   const volumes: TopoVolume[] = [
     { kind: 'ambient', group: 0, volume: 1 },
     { kind: 'plenum', group: 0, volume: p.plenumVolume * 1e-3 },
@@ -78,11 +95,30 @@ export function buildTopology(p: Params, layout: ResolvedLayout, dt: number): To
   const dHead = p.headerDiameter * MM;
   const dTail = p.tailDiameter * MM;
 
-  pipes.push({ kind: 'intake', cyl: -1, group: 0, length: p.intakeLength * MM, diameter: p.throttleBody * MM, volL: VOL_AMBIENT, volR: VOL_PLENUM, wallT: 300, cells: 0, radiates: false });
+  // Intake side: (snorkel -> airbox ->) intake pipe (-> compressor => charge volume -> charge pipe) -> throttle -> plenum.
+  const boostKind = p.boost | 0;
+  const turbo = boostKind === 1;
+  const hasBox = p.airbox > 0.5;
+  const dIntake = p.throttleBody * MM * (p.intakePipeRatio / 100);
+  const boost = { compIn: -1, charge: -1, turbIn: -1, turbOut: -1 };
+  let airboxVol = -1;
+  if (hasBox) airboxVol = volumes.push({ kind: 'airbox', group: 0, volume: p.airboxVolume * 1e-3 }) - 1;
+  if (boostKind > 0) {
+    boost.compIn = volumes.push({ kind: 'compressor', group: 0, volume: 0.6e-3 }) - 1;
+    boost.charge = volumes.push({ kind: 'charge', group: 0, volume: p.chargeVolume * 1e-3 }) - 1;
+  }
+  pipes.push({
+    kind: 'intake', cyl: -1, group: 0, length: p.intakeLength * MM, diameter: dIntake, volL: hasBox ? airboxVol : VOL_AMBIENT, volR: boostKind > 0 ? boost.compIn : VOL_PLENUM,
+    wallT: 300, cells: 0, radiates: false,
+  });
   const runnerPipe: number[] = [];
+  const taper = 1 + p.runnerTaper / 100;
   for (let i = 0; i < n; i++) {
     runnerPipe.push(pipes.length);
-    pipes.push({ kind: 'runner', cyl: i, group: 0, length: p.runnerLength * MM, diameter: dRun, volL: VOL_PLENUM, volR: VOL_CYL0 + i, wallT: 320, cells: 0, radiates: false });
+    pipes.push({
+      kind: 'runner', cyl: i, group: 0, length: p.runnerLength * MM, diameter: dRun, volL: VOL_PLENUM, volR: VOL_CYL0 + i, wallT: 320, cells: 0, radiates: false,
+      shape: taper > 1.001 ? [[0, taper * dRun], [1, dRun]] : undefined,
+    });
   }
 
   const group = collector === 0 ? new Array(n).fill(0) : layout.group;
@@ -101,14 +137,16 @@ export function buildTopology(p: Params, layout: ResolvedLayout, dt: number): To
     const split = p.rearSplit > 0.5 && collector < 2;
     const nMuff = split ? 2 : collector === 2 ? nGroups : 1;
     const muffler0 = volumes.length;
-    for (let m = 0; m < nMuff; m++) volumes.push({ kind: 'muffler', group: m, volume: (p.mufflerVolume * 1e-3) / nMuff });
+    const noMuffler = (p.mufflerType | 0) === MUFFLER_DELETE;
+    // with the muffler cut out, what is left is a plain joint the size of the pipe
+    for (let m = 0; m < nMuff; m++) volumes.push({ kind: 'muffler', group: m, volume: noMuffler ? area(dTail) * 0.1 : (p.mufflerVolume * 1e-3) / nMuff });
     const dMid = collector === 1 && nGroups > 1 ? dTail * 0.8 : dTail;
     const members: number[][] = Array.from({ length: nGroups }, () => []);
     group.forEach((g, i) => members[g].push(i));
     const pending: { i: number; g: number; to: number; extra: number }[] = [];
     for (let g = 0; g < nGroups; g++) {
       const muff = muffler0 + (collector === 2 ? g : 0);
-      if (members[g].length === 1 && !split) {
+      if (members[g].length === 1 && !split && !turbo) {
         // One cylinder in the group: no merge, the header runs straight to the muffler.
         pending.push({ i: members[g][0], g, to: muff, extra: p.midLength * MM });
       } else {
@@ -138,8 +176,22 @@ export function buildTopology(p: Params, layout: ResolvedLayout, dt: number): To
     const junctions: number[] = [];
     volumes.forEach((v, idx) => v.kind === 'junction' && junctions.push(idx));
     const L = p.midLength * MM;
+    // The turbine sits where all the exhaust has come together: housing volumes either side of the wheel.
+    const turbine = (from: number): number => {
+      boost.turbIn = from;
+      const all = [...volumes, ...extra];
+      all[from].volume = Math.max(all[from].volume, 0.45e-3);
+      return (boost.turbOut = addVol({ kind: 'turbine', group: 0, volume: 0.4e-3 }));
+    };
     if (!split) {
-      for (const v of junctions) main(v, muffler0 + (collector === 2 ? volumes[v].group : 0), L, dMid, volumes[v].group);
+      if (turbo) {
+        let from = junctions[0];
+        if (junctions.length > 1) {
+          from = addVol({ kind: 'junction', group: 0, volume: (junctions.length * area(dMid) + area(dTail)) * 0.08 });
+          for (const v of junctions) mid(v, from, 0.15 * L, dMid, volumes[v].group, 600);
+        }
+        main(turbine(from), muffler0, junctions.length > 1 ? 0.85 * L : L, dTail, 0);
+      } else for (const v of junctions) main(v, muffler0 + (collector === 2 ? volumes[v].group : 0), L, dMid, volumes[v].group);
     } else {
       // One pipe runs back from the engine and splits in a Y to a muffler and tailpipe on each side.
       const dMain = dTail * 1.2;
@@ -151,7 +203,7 @@ export function buildTopology(p: Params, layout: ResolvedLayout, dt: number): To
         rest = 0.5;
       }
       const y = addVol({ kind: 'junction', group: 0, volume: (area(dMain) + 2 * area(dTail)) * 0.08 });
-      main(from, y, rest * L, dMain, 0);
+      main(turbo ? turbine(from) : from, y, rest * L, dMain, 0);
       for (let m = 0; m < 2; m++) mid(y, muffler0 + m, 0.35 * L, dTail, m, 480);
     }
     volumes.push(...extra);
@@ -160,7 +212,22 @@ export function buildTopology(p: Params, layout: ResolvedLayout, dt: number): To
     }
   }
 
-  return finish(p, layout, dt, volumes, pipes, { intakePipes: [0], runnerPipe, headerPipe, transferPipe: [], crankcase: [], twoStroke: false }, [layout.def.kind, n, collector, group.join('')].join('|'));
+  // Appended last so the exhaust pipes keep their places in the list.
+  let mouth = 0, throttle = 0;
+  if (hasBox) {
+    mouth = pipes.length;
+    const dSn = p.snorkelDiameter * MM;
+    pipes.push({ kind: 'snorkel', cyl: -1, group: 0, length: p.snorkelLength * MM, diameter: dSn, volL: VOL_AMBIENT, volR: airboxVol, wallT: 300, cells: 0, radiates: false });
+  }
+  if (boostKind > 0) {
+    throttle = pipes.length;
+    pipes.push({ kind: 'charge', cyl: -1, group: 0, length: Math.max(0.25, 0.8 * p.intakeLength * MM), diameter: p.throttleBody * MM, volL: boost.charge, volR: VOL_PLENUM, wallT: 320, cells: 0, radiates: false });
+  }
+  return finish(
+    p, layout, dt, volumes, pipes,
+    { intakePipes: [mouth], throttlePipes: [throttle], filterPipes: [0], boost, runnerPipe, headerPipe, transferPipe: [], crankcase: [], twoStroke: false },
+    [layout.def.kind, n, collector, group.join(''), hasBox ? 'box' : '', boostKind].join('|'),
+  );
 }
 
 /**
@@ -220,12 +287,12 @@ function buildTwoStroke(p: Params, layout: ResolvedLayout, dt: number): Topology
   if (silenced) {
     for (let i = 0; i < n; i++) pipes.push({ kind: 'tail', cyl: -1, group: i, length: p.tailLength * MM * 0.3 + 0.1, diameter: Math.min(p.tailDiameter * MM, dSting * 1.2), volL: muffler0 + i, volR: VOL_AMBIENT, wallT: 450, cells: 0, radiates: true });
   }
-  return finish(p, layout, dt, volumes, pipes, { intakePipes, runnerPipe, headerPipe, transferPipe, crankcase, twoStroke: true }, ['2T', layout.def.kind, n, silenced ? 1 : 0].join('|'));
+  return finish(p, layout, dt, volumes, pipes, { intakePipes, throttlePipes: intakePipes, filterPipes: intakePipes, boost: { compIn: -1, charge: -1, turbIn: -1, turbOut: -1 }, runnerPipe, headerPipe, transferPipe, crankcase, twoStroke: true }, ['2T', layout.def.kind, n, silenced ? 1 : 0].join('|'));
 }
 
 function finish(
   p: Params, layout: ResolvedLayout, dt: number, volumes: TopoVolume[], pipes: TopoPipe[],
-  idx: Pick<Topology, 'intakePipes' | 'runnerPipe' | 'headerPipe' | 'transferPipe' | 'crankcase' | 'twoStroke'>, sigBase: string,
+  idx: Pick<Topology, 'intakePipes' | 'throttlePipes' | 'filterPipes' | 'boost' | 'runnerPipe' | 'headerPipe' | 'transferPipe' | 'crankcase' | 'twoStroke'>, sigBase: string,
 ): Topology {
   const n = layout.n;
   // Acoustic end corrections: 0.61 a for an unflanged end in free air, 0.85 a into a large volume.
@@ -236,7 +303,7 @@ function finish(
         const kind = volumes[v].kind;
         // with the radiation model the open end carries its own inertance
         if (kind === 'ambient') q.length += (p.fxEnds | 0) === 1 ? 0.61 * a : 0;
-        else if ((kind === 'plenum' && !(q.kind === 'intake' && isRight)) || kind === 'muffler') q.length += 0.85 * a;
+        else if ((kind === 'plenum' && !(isRight && idx.throttlePipes.includes(pipes.indexOf(q)))) || kind === 'muffler' || kind === 'airbox' || kind === 'charge') q.length += 0.85 * a;
       }
     }
   }
@@ -246,11 +313,12 @@ function finish(
     if (volumes[v].kind === 'cylinder' || volumes[v].kind === 'crankcase') continue;
     let sumA = 0;
     for (const q of pipes) if (q.volL === v || q.volR === v) sumA += area(q.diameter);
-    const c = volumes[v].kind === 'plenum' ? 420 : 750;
+    const kind = volumes[v].kind;
+    const c = kind === 'plenum' || kind === 'airbox' || kind === 'compressor' || kind === 'charge' ? 420 : 750;
     volumes[v].volume = Math.max(volumes[v].volume, 3 * c * sumA * dt);
   }
 
-  assignCells(pipes, dt, p.cellBudget || 200);
+  const singleStepCells = assignCells(pipes, dt, p.cellBudget || 200);
   let totalCells = 0;
   for (const q of pipes) {
     totalCells += q.cells;
@@ -265,26 +333,42 @@ function finish(
       }
     }
   }
-  return { signature: [sigBase, volumes.length, pipes.length].join('|'), volumes, pipes, nCyl: n, cylVol0: VOL_CYL0, intakePipe: 0, ...idx, totalCells };
+  return { signature: [sigBase, volumes.length, pipes.length].join('|'), volumes, pipes, nCyl: n, cylVol0: VOL_CYL0, intakePipe: 0, ...idx, totalCells, singleStepCells };
 }
 
-/** Cells per pipe: finest spacing the budget allows, never finer than the CFL limit at this dt. */
-export function assignCells(pipes: TopoPipe[], dt: number, budget: number): void {
+/**
+ * Cells per pipe: the finest spacing the budget allows. With one solver step per sample a pipe
+ * cannot be divided finer than a time step can carry (the CFL limit); the most cells that gives
+ * is returned. Budgets up to FINE_ABOVE never go past that, so a short system simply stops gaining.
+ * Above it the budget means "finer than one step allows": FINE_ABOVE to twice FINE_ABOVE scales the
+ * cells from that most to about twice it, and the solver then takes two or more steps per sample.
+ */
+export const FINE_ABOVE = 600;
+export function assignCells(pipes: TopoPipe[], dt: number, budget: number): number {
   let totalLength = 0;
   for (const q of pipes) totalLength += q.length;
+  const cold = (q: TopoPipe) => q.kind === 'intake' || q.kind === 'snorkel' || q.kind === 'runner' || q.kind === 'transfer';
   // Sized so one step per sample holds even during hot, near-sonic blowdown.
-  const dxCold = (700 * dt) / 0.78;
-  const dxHot = (1350 * dt) / 0.78;
-  let dxTarget = Math.max(0.025, totalLength / budget);
-  for (let pass = 0; pass < 6; pass++) {
+  const most = (q: TopoPipe, fine: number) => Math.max(2, Math.floor(q.length / ((fine * (cold(q) ? 700 : 1350) * dt) / 0.78)));
+  const capacity = (fine: number) => {
+    let n = 0;
+    for (const q of pipes) { const nMax = most(q, fine); n += Math.max(Math.min(3, nMax), Math.min(nMax, Math.round(q.length / (0.025 * fine)))); }
+    return n;
+  };
+  const single = capacity(1);
+  const fine = budget > FINE_ABOVE ? 0.5 : 1;
+  if (fine < 1) budget = Math.round(single * (budget / FINE_ABOVE));
+  // at or above what this spacing can hold, every pipe simply gets its most
+  let dxTarget = budget >= capacity(fine) ? 0.025 * fine : Math.max(0.025 * fine, totalLength / budget);
+  for (let pass = 0; pass < 8; pass++) {
     let total = 0;
     for (const q of pipes) {
-      const dxMin = q.kind === 'intake' || q.kind === 'runner' || q.kind === 'transfer' ? dxCold : dxHot;
-      const nMax = Math.max(2, Math.floor(q.length / dxMin));
+      const nMax = most(q, fine);
       q.cells = Math.max(Math.min(3, nMax), Math.min(nMax, Math.round(q.length / dxTarget)));
       total += q.cells;
     }
     if (total <= budget) break;
-    dxTarget *= Math.max(1.05, total / budget);
+    dxTarget *= Math.max(1.02, total / budget);
   }
+  return single;
 }

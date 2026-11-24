@@ -9,12 +9,47 @@ import { Controls } from './ui/controls';
 import { Instruments, cylColor } from './ui/instruments';
 import { MODEL_NOTES_HTML } from './ui/modelNotes';
 import { CYL_SCALE, ColorMode, legend } from './view3d/colors';
+import { makeDraggable } from './ui/drag';
+import { Dyno } from './ui/dyno';
+import { ViewOptions } from './ui/viewOptions';
 import { EngineView } from './view3d/engineView';
+import { PART_PARAMS } from './view3d/parts';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 
 let presetId = 'i4';
 let params: Params = presetParams(presetId);
+
+// Audio, car body and model fidelity settings belong to the listening setup, not the engine: they are kept between visits.
+const SETTINGS_GROUPS = ['Audio', 'Car body', 'Model fidelity', 'Mechanical noise'];
+const SETTINGS_DEFS = PARAM_DEFS.filter((d) => SETTINGS_GROUPS.includes(d.group));
+const SETTINGS_STORE = 'engine-sim.settings.v1';
+const BUDGET_DEFAULT = 140;
+let setBudgetWidget: (cells: number) => void = () => {};
+function loadSettings(): Params {
+  const out: Params = {};
+  try {
+    const saved = JSON.parse(localStorage.getItem(SETTINGS_STORE) ?? '{}') as Record<string, unknown>;
+    // only known keys, snapped into range, so a stale or edited entry cannot break the page
+    for (const d of SETTINGS_DEFS) {
+      const v = saved[d.key];
+      if (typeof v === 'number' && Number.isFinite(v)) out[d.key] = Math.min(d.max, Math.max(d.min, d.kind === 'slider' ? v : Math.round(v)));
+    }
+    const cells = saved.cellBudget;
+    if (typeof cells === 'number' && Number.isFinite(cells)) out.cellBudget = Math.min(1200, Math.max(60, Math.round(cells)));
+  } catch {
+    // storage blocked or corrupt: run on defaults
+  }
+  return out;
+}
+function saveSettings(): void {
+  try {
+    localStorage.setItem(SETTINGS_STORE, JSON.stringify({ ...Object.fromEntries(SETTINGS_DEFS.map((d) => [d.key, params[d.key]])), cellBudget: params.cellBudget }));
+  } catch {
+    // private window or storage full: the settings still apply for this visit
+  }
+}
+Object.assign(params, loadSettings());
 const audio = new EngineAudio();
 const view = new EngineView($('view3d'));
 const instruments = new Instruments({
@@ -23,8 +58,8 @@ const instruments = new Instruments({
 
 // ------------------------------------------------------------- parameters
 
-const KEEP_ON_PRESET = ['drive', 'autoShift', 'autoClutch', 'abs', 'tc', 'mixCar', 'volume', 'mixExhaust', 'mixIntake', 'mixMech', 'listenerPos', 'listenerDist', 'timeScale', 'paused', 'cellBudget', ...PARAM_DEFS.filter((d) => d.tiers).map((d) => d.key)];
-const RESTART_KEYS = new Set(['rearSplit', 'catalyst', 'mufflerType', 'strokes', 'chamberSilencer', 'induction', 'layout', 'cylinders', 'crank', 'firingOrder', 'collector']);
+const KEEP_ON_PRESET = ['drive', 'autoShift', 'autoClutch', 'abs', 'tc', 'mixCar', 'volume', 'mixExhaust', 'mixIntake', 'mixMech', 'micX', 'micY', 'micZ', 'carBody', 'bonnetOpen', 'windowsOpen', 'undertray', 'bayLining', 'firewallMass', 'cabinMass', 'cabinAbsorb', 'timeScale', 'paused', 'cellBudget', ...PARAM_DEFS.filter((d) => d.tiers).map((d) => d.key)];
+const RESTART_KEYS = new Set(['airbox', 'boost', 'rearSplit', 'catalyst', 'mufflerType', 'strokes', 'chamberSilencer', 'induction', 'layout', 'cylinders', 'crank', 'firingOrder', 'collector']);
 
 function push(values: Params): void {
   audio.setParams(values);
@@ -47,8 +82,9 @@ function setParam(key: string, value: number): void {
   }
   Object.assign(params, changed);
   for (const k in changed) controls.set(k, changed[k]);
-  if (key in { vtec: 1, vtc: 1, vtcRange: 1, vtecRpm: 1, strokes: 1, induction: 1, exhaustPortOpen: 1, transferPortOpen: 1, layout: 1, cylinders: 1, crank: 1, firingOrder: 1, bankAngle: 1, bore: 1, stroke: 1, rodLength: 1, intakeDuration: 1, exhaustDuration: 1, lsa: 1, camAdvance: 1 }) controls.refreshDynamic();
+  if (key in { airbox: 1, boost: 1, fxMech: 1, vtec: 1, vtc: 1, vtcRange: 1, vtecRpm: 1, strokes: 1, induction: 1, exhaustPortOpen: 1, transferPortOpen: 1, layout: 1, cylinders: 1, crank: 1, firingOrder: 1, bankAngle: 1, bore: 1, stroke: 1, rodLength: 1, intakeDuration: 1, exhaustDuration: 1, lsa: 1, camAdvance: 1 }) controls.refreshDynamic();
   push(changed);
+  if (SETTINGS_DEFS.some((d) => d.key in changed)) saveSettings();
   if (RESTART_KEYS.has(key)) audio.autoStart();
   if (key === 'layout' || key === 'cylinders') buildCylChips();
 }
@@ -88,7 +124,7 @@ $('preset-blurb').textContent = PRESETS[0].blurb;
   const audioPanel = controls.panels.get('Audio')!;
   const n2 = document.createElement('div');
   n2.className = 'note';
-  n2.innerHTML = 'Exhaust and intake are the simulated flow at the pipe mouths. <b>Mechanical is faked</b>: filtered cylinder pressure and valve ticks. See Model notes.';
+  n2.innerHTML = 'Exhaust and intake are the simulated flow at the pipe mouths. Mechanical is the block ringing under simulated forces: gas load, piston slap, valve seating, injectors, the timing drive and surface roughness. See Model notes.';
   audioPanel.appendChild(n2);
   const recRow = document.createElement('div');
   recRow.className = 'btn-row';
@@ -125,21 +161,32 @@ $('preset-blurb').textContent = PRESETS[0].blurb;
   const sim = document.createElement('div');
   sim.innerHTML = `<div class="panel-body" style="padding:0">
     <div class="note">Each row is one aspect of the engine. The badge says what the current choice is: <b style="color:#6fd08c">modelled</b> from physics, <b>approximated</b>, <b style="color:var(--danger)">faked</b>, or left out.</div>
-    <label class="row"><div class="row-head"><span class="row-label">Pipe resolution</span>
-      <select id="budget"><option value="60">Coarse (60 cells)</option><option value="100">Low (100)</option><option value="140">Medium (140)</option><option value="200">High (200)</option><option value="300">Very high (300)</option></select></div></label>
-    <div class="note" id="sim-note">Total finite-volume cells across all pipes. If the audio thread runs out of time this is lowered automatically; the physics is never dropped.</div></div>`;
+    <label class="row row-slider"><div class="row-head"><span class="row-label">Pipe resolution</span><span class="row-value" id="budget-value"></span></div>
+      <input id="budget" type="range" min="60" max="1200" step="10" /></label>
+    <div class="note" id="budget-live"></div>
+    <div class="note" id="sim-note">Upper limit on finite-volume cells across all pipes; the status line under the gauges shows how many are in use. Up to 600 this is a ceiling: a pipe is never divided finer than one time step allows (about 2 cm for intake pipes and 4 cm for exhaust at 48 kHz), so a short system stops gaining before the ceiling. Above 600 the slider asks for cells finer than that, up to about twice as many at 1200, and the solver then takes two or more steps per sample, which costs several times as much. If the audio thread runs out of time the limit is lowered automatically; the physics is never dropped.</div></div>`;
   controls.panels.get('Model fidelity')!.prepend(sim);
-  const budget = $<HTMLSelectElement>('budget');
-  budget.value = String(params.cellBudget);
+  const budget = $<HTMLInputElement>('budget');
+  const showBudget = (cells: number) => {
+    budget.value = String(cells);
+    $('budget-value').textContent = `${cells} cells`;
+    budget.style.setProperty('--fill', `${((cells - 60) / 1140) * 100}%`);
+  };
+  showBudget(params.cellBudget);
+  budget.addEventListener('input', () => showBudget(Number(budget.value)));
+  // changing it rebuilds the pipe network, so apply on release, not on every step of the drag
   budget.addEventListener('change', () => {
     params.cellBudget = Number(budget.value);
     push({ cellBudget: params.cellBudget });
+    saveSettings();
   });
+  setBudgetWidget = showBudget;
   audio.onQuality = (cells, load) => {
     params.cellBudget = cells;
     view.setParams(params);
-    if (![...budget.options].some((o) => Number(o.value) === cells)) budget.appendChild(new Option(`Auto-reduced (${cells})`, String(cells)));
-    budget.value = String(cells);
+    showBudget(cells);
+    // remember what this machine can sustain, so the next visit does not start by overloading
+    saveSettings();
     $('sim-note').innerHTML = `<b>Pipe resolution was reduced to ${cells} cells</b> because the audio thread was at ${(load * 100).toFixed(0)} % load. All physics is still running.`;
   };
 }
@@ -427,18 +474,116 @@ $('cutaway').addEventListener('click', (e) => {
   view.setCutaway(on);
 });
 $('exploded').addEventListener('click', (e) => view.setExploded((e.currentTarget as HTMLElement).classList.toggle('on')));
-$('pv-log').addEventListener('click', (e) => {
-  instruments.pvLog = !instruments.pvLog;
-  (e.currentTarget as HTMLElement).textContent = instruments.pvLog ? 'linear' : 'log';
-});
+// Display options: a gear on every plot and one button for the 3D view.
+const viewOptions = new ViewOptions();
+instruments.opt = viewOptions.values;
+for (const b of document.querySelectorAll<HTMLElement>('[data-viz]')) viewOptions.attach(b, b.dataset.viz!);
+viewOptions.onChange = () => view.setViewOptions(viewOptions.values);
+view.setViewOptions(viewOptions.values);
 
 const aboutDialog = $<HTMLDialogElement>('about-dialog');
 $('about-body').innerHTML = MODEL_NOTES_HTML;
 $('about').addEventListener('click', () => aboutDialog.showModal());
 
+// Audio and model fidelity live in a floating settings panel, not the engine's side panel.
+{
+  const dialog = $<HTMLDialogElement>('settings-dialog'), button = $('settings');
+  for (const g of SETTINGS_GROUPS) {
+    const det = controls.panels.get(g)!.parentElement as HTMLDetailsElement;
+    // the per-source mechanical controls stay folded away until wanted
+    det.open = g !== 'Mechanical noise' && g !== 'Car body';
+    $('settings-body').appendChild(det);
+  }
+  const mechPanel = controls.panels.get('Mechanical noise')!;
+  const mechNote = document.createElement('div');
+  mechNote.className = 'note';
+  mechNote.textContent = 'Each kind of mechanical noise has its own volume. 100 % is the balance fitted to an engine-bay recording. Piston clearance, valve lash and the timing drive type are in the engine panels.';
+  mechPanel.insertBefore(mechNote, mechPanel.firstChild);
+  mechPanel.parentElement!.querySelector('summary')!.textContent = 'Mechanical noise: per-source detail';
+  const show = (on: boolean) => {
+    if (on) dialog.show(); else dialog.close();
+    button.classList.toggle('on', on);
+  };
+  button.addEventListener('click', () => show(!dialog.open));
+  $('settings-close').addEventListener('click', () => show(false));
+  dialog.addEventListener('close', () => button.classList.remove('on'));
+  $('settings-defaults').addEventListener('click', () => {
+    for (const d of SETTINGS_DEFS) if (params[d.key] !== d.def) setParam(d.key, d.def);
+    if (params.cellBudget !== BUDGET_DEFAULT) {
+      params.cellBudget = BUDGET_DEFAULT;
+      setBudgetWidget(BUDGET_DEFAULT);
+      push({ cellBudget: BUDGET_DEFAULT });
+    }
+    saveSettings();
+  });
+}
+
+// Dynamometer panel.
+const dyno = new Dyno($('dyno-body'), {
+  audio,
+  params: () => params,
+  setParam,
+  push: (values) => { Object.assign(params, values); audio.setParams(values); },
+  presetName: () => PRESETS.find((p) => p.id === presetId)?.name ?? presetId,
+});
+{
+  const dialog = $<HTMLDialogElement>('dyno-dialog'), button = $('dyno');
+  const show = (on: boolean) => {
+    if (on) dialog.show(); else dialog.close();
+    button.classList.toggle('on', on);
+  };
+  button.addEventListener('click', () => show(!dialog.open));
+  $('dyno-close').addEventListener('click', () => show(false));
+}
+
+// Panels that stay open while you work can be dragged out of the way by their header; the part label by
+// anywhere that is not a control. The model notes are a modal page of text and stay put.
+for (const id of ['settings-dialog', 'dyno-dialog']) {
+  const d = $(id);
+  makeDraggable(d, d.querySelector<HTMLElement>('.settings-head')!);
+}
+let labelMoved = false;
+makeDraggable($('partlabel'), $('partlabel'), () => (labelMoved = true));
+
+view.onMicMove = (x, y, z) => {
+  const round = (v: number) => Math.round(v * 100) / 100;
+  for (const [k, v] of [['micX', x], ['micY', y], ['micZ', z]] as const) if (round(v) !== params[k]) setParam(k, round(v));
+};
+$('show-mic').addEventListener('click', () => view.showMic());
+// Places to listen from, offered while the microphone is selected.
+const micPresetBar = $('mic-presets');
+function buildMicPresets(): void {
+  micPresetBar.replaceChildren(Object.assign(document.createElement('span'), { className: 'muted', textContent: 'Move it to' }));
+  view.micPresets().forEach((preset, i) => {
+    const b = document.createElement('button');
+    b.textContent = preset.name;
+    b.title = preset.hint;
+    b.addEventListener('click', () => {
+      // positions follow the engine and exhaust as they are now, not as they were when the buttons were made
+      const [x, y, z] = view.micPresets()[i].at;
+      setParam('micX', x);
+      setParam('micY', y);
+      setParam('micZ', z);
+      view.showMic();
+    });
+    micPresetBar.appendChild(b);
+  });
+}
+
 const partLabel = $('partlabel');
-view.onPick = (info) => {
+// A picked part brings its own sliders: the label stops following the part and stays where it was clicked.
+let pinPending = false;
+view.onPick = (info, key) => {
   partLabel.hidden = !info;
+  // a fresh pick puts the label back where it belongs
+  labelMoved = false;
+  partLabel.style.transform = '';
+  const rows = (key ? PART_PARAMS[key] ?? [] : []).filter((k) => controls.applies(k) || k.startsWith('mic')).map((k) => controls.extraRow(k)).filter((r): r is HTMLElement => !!r);
+  $('part-params').replaceChildren(...rows);
+  const pinned = rows.length > 0 && key !== 'microphone';
+  partLabel.classList.toggle('pinned', pinned);
+  view.holdPick = pinned;
+  pinPending = pinned;
   if (info) {
     partLabel.querySelector('b')!.textContent = info.title;
     partLabel.querySelector('p')!.textContent = info.text;
@@ -527,6 +672,7 @@ function updateGauges(dt: number): void {
     `${audio.ctx!.sampleRate / 1000} kHz · ${s.nCells} pipe cells · ${s.h(H.substeps) > 1 ? `<span class="warn">${s.h(H.substeps)} sub-steps</span> · ` : ''}` +
     `audio thread <span class="${load > 0.6 ? 'warn' : ''}">${(load * 100).toFixed(0)} %</span><br>${fps.toFixed(0)} fps` +
     ` · ${Math.max(0, s.h(H.spl)).toFixed(0)} dB SPL` +
+    (params.boost > 0.5 && params.strokes < 0.5 ? ` · boost ${(s.h(H.boost) / 1e3).toFixed(0)} kPa, compressor ${(s.h(H.turboRpm) / 1000).toFixed(0)}k rpm${params.boost < 1.5 ? `, wastegate ${(s.h(H.wastegate) * 100).toFixed(0)} %` : ''}` : '') +
     (params.fxWalls > 0.5 ? ` · header wall ${s.h(H.wallT).toFixed(0)} K` : '') +
     (params.vtc > 0.5 && s.h(H.strokes) === 4 ? ` · VTC ${s.h(H.vtc).toFixed(0)}°` : '') +
     (params.vtec > 0.5 && s.h(H.strokes) === 4 ? (s.h(H.vtec) > 0.5 ? ' · <span class="warn">VTEC high cam</span>' : ' · low cam') : '') +
@@ -548,13 +694,34 @@ function loop(now: number): void {
     driveView!.render(audio.snap, dt);
     updateHud();
   } else view.render(audio.snap, dt);
-  if (view.labelPos && !partLabel.hidden) {
+  if (view.labelDocked && !partLabel.classList.contains('docked')) buildMicPresets();
+  partLabel.classList.toggle('docked', view.labelDocked);
+  if (labelMoved) {
+    // the user has put it somewhere: leave it there
+  } else if (view.labelDocked) {
+    partLabel.style.left = partLabel.style.top = '';
+    partLabel.style.visibility = 'visible';
+  } else if (partLabel.classList.contains('pinned')) {
+    if (pinPending && view.labelPos) {
+      // beside the click, kept inside the view and clear of the throttle pedal
+      const stage = partLabel.parentElement!;
+      partLabel.style.left = `${Math.max(8, Math.min(stage.clientWidth - partLabel.offsetWidth - 60, view.labelPos.x + 16))}px`;
+      partLabel.style.top = `${Math.max(8, Math.min(stage.clientHeight - partLabel.offsetHeight - 8, view.labelPos.y - 40))}px`;
+      partLabel.style.visibility = 'visible';
+      pinPending = false;
+    }
+  } else if (view.labelPos && !partLabel.hidden) {
     partLabel.style.left = `${view.labelPos.x}px`;
     partLabel.style.top = `${view.labelPos.y}px`;
     partLabel.style.visibility = 'visible';
   } else partLabel.style.visibility = 'hidden';
+  dyno.tick(dt);
   instruments.draw(audio, params);
   updateGauges(dt);
+  if (frame % 20 === 0 && audio.snap) {
+    const steps = audio.snap.h(H.substeps);
+    $('budget-live').textContent = `In use now: ${audio.snap.nCells} cells, ${steps} solver step${steps > 1 ? 's' : ''} per sample, audio thread at ${(audio.snap.h(H.cpuLoad) * 100).toFixed(0)} %.`;
+  }
   if (frame++ % 20 === 0 && params.timeScale < 0.999) updateSpeedLabel();
   requestAnimationFrame(loop);
 }

@@ -3,6 +3,9 @@
 
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { GROUND_Y, MUFFLER_RADIUS, MicPreset, Placement, Vec3, micPresets, place } from '../sim/placement';
+import { CarBodyRig, buildCarBody } from './carBody';
+import { MicGizmo } from './micGizmo';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import type { TopologyInfo } from '../sim/engine';
 import { P_ATM, T_ATM } from '../sim/gas';
@@ -17,6 +20,8 @@ import { PART_INFO } from './parts';
 
 interface CylRig {
   group: THREE.Group;
+  flash: THREE.Sprite;
+  glow: number;
   piston: THREE.Group;
   rod: THREE.Group;
   gas: THREE.Mesh;
@@ -73,6 +78,9 @@ interface PortFrame {
 
 interface PipeRig {
   mesh: THREE.Mesh;
+  /** Centreline point of each ring, for placing afterfire flashes. */
+  centres: Float32Array;
+  diameter: number;
   rings: number;
   radial: number;
   index: number;
@@ -92,6 +100,7 @@ const GEOMETRY_KEYS = [
   'layout', 'cylinders', 'bankAngle', 'crank', 'firingOrder', 'bore', 'stroke', 'rodLength', 'compression',
   'throttleBody', 'intakeLength', 'runnerLength', 'runnerDiameter', 'plenumVolume', 'headerLength', 'headerDiameter',
   'rearSplit', 'catalyst', 'mufflerType', 'headerSpread', 'mechDetail', 'strokes', 'valvesPerCyl', 'intakeValveSize', 'exhaustValveSize', 'exhaustPortOpen', 'transferPortOpen', 'chamberDiameter', 'chamberSilencer', 'collector', 'midLength', 'mufflerVolume', 'tailLength', 'tailDiameter', 'cellBudget',
+  'airbox', 'airboxVolume', 'snorkelLength', 'boost', 'chargeVolume', 'turboSize', 'intakePipeRatio', 'runnerTaper',
 ];
 
 /** Only the detailed view draws cam lobes to scale, so only it rebuilds for these. */
@@ -99,6 +108,34 @@ const DETAIL_KEYS = [
   'vtec', 'vtc', 'camProfile', 'intakeLift', 'exhaustLift', 'intakeDuration', 'exhaustDuration',
   'lowIntakeLift', 'lowExhaustLift', 'lowIntakeDuration', 'lowExhaustDuration', 'lsa', 'camAdvance',
 ];
+
+/** How long a flash lingers on screen, seconds: a real burn is over in about a millisecond. */
+const FLASH_HOLD = 0.07;
+const FIRE_POOL = 96;
+
+let glowTex: THREE.Texture | null = null;
+/** A soft additive glow drawn over everything, so a flash shows through the block and the pipe walls. */
+function glowSprite(r: number, g: number, b: number): THREE.Sprite {
+  if (!glowTex) {
+    const c = document.createElement('canvas');
+    c.width = c.height = 128;
+    const x = c.getContext('2d')!;
+    const grad = x.createRadialGradient(64, 64, 0, 64, 64, 64);
+    grad.addColorStop(0, 'rgba(255,255,255,1)');
+    grad.addColorStop(0.22, 'rgba(255,255,255,0.9)');
+    grad.addColorStop(0.5, 'rgba(255,255,255,0.32)');
+    grad.addColorStop(1, 'rgba(255,255,255,0)');
+    x.fillStyle = grad;
+    x.fillRect(0, 0, 128, 128);
+    glowTex = new THREE.CanvasTexture(c);
+  }
+  const mat = new THREE.SpriteMaterial({ map: glowTex, color: new THREE.Color(r, g, b), blending: THREE.AdditiveBlending, depthTest: false, depthWrite: false, transparent: true, toneMapped: false });
+  const sp = new THREE.Sprite(mat);
+  sp.renderOrder = 20;
+  sp.visible = false;
+  sp.raycast = () => {};
+  return sp;
+}
 
 const tmpColor: [number, number, number] = [0, 0, 0];
 const tmpPt = { x: 0, y: 0, ang: 0 };
@@ -115,6 +152,9 @@ export class EngineView {
   private cyls: CylRig[] = [];
   private pipes: PipeRig[] = [];
   private vols: VolRig[] = [];
+  private fireSprites: THREE.Sprite[] = [];
+  /** Afterfire brightness per solver cell, held so a brief flame stays visible. */
+  private fireHold = new Float32Array(0);
   private shellMats: THREE.MeshStandardMaterial[] = [];
   private cutPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
   private params: Params | null = null;
@@ -140,11 +180,28 @@ export class EngineView {
   private frameSig = '';
   private lastFrameSig = '';
 
+  private mic: MicGizmo;
+  private grid!: THREE.GridHelper;
+  /** Sound paths, source markers and air spaces: drawn on request, never part of the engine. */
+  private overlay = new THREE.Group();
+  private vo: Record<string, number> = {};
+  private body: CarBodyRig | null = null;
+  private bodySig = '';
+  private placement: Placement | null = null;
+  /** Called while the microphone is dragged: sideways, height above ground, towards the rear. */
+  onMicMove: (x: number, y: number, z: number) => void = () => {};
+
   private raycaster = new THREE.Raycaster();
   private picked: { object: THREE.Object3D; local: THREE.Vector3; key: string } | null = null;
-  onPick: (info: { title: string; text: string } | null) => void = () => {};
+  onPick: (info: { title: string; text: string } | null, key?: string) => void = () => {};
+  /** Keep the picked part's label open across a rebuild of the model. */
+  holdPick = false;
   /** Screen position of the picked point, or null when nothing is picked / visible. */
   labelPos: { x: number; y: number } | null = null;
+  /** The label belongs in a corner, clear of the thing picked (the microphone and its arrows). */
+  get labelDocked(): boolean {
+    return this.picked?.key === 'microphone';
+  }
 
   constructor(private container: HTMLElement) {
     const renderer = (this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true }));
@@ -161,14 +218,28 @@ export class EngineView {
     key.position.set(1.2, 2, 1.5);
     this.scene.add(key);
 
-    this.camera = new THREE.PerspectiveCamera(36, 1, 0.02, 60);
+    this.camera = new THREE.PerspectiveCamera(36, 1, 0.02, 80);
     this.camera.position.set(0.9, 0.55, 1.1);
     this.controls = new OrbitControls(this.camera, renderer.domElement);
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.08;
     this.controls.minDistance = 0.15;
-    this.controls.maxDistance = 8;
+    this.controls.maxDistance = 18;
     this.scene.add(this.root);
+
+    const grid = (this.grid = new THREE.GridHelper(24, 48, 0x5b6673, 0x39414b));
+    this.scene.add(this.overlay);
+    grid.position.y = GROUND_Y;
+    const gm = grid.material as THREE.Material;
+    gm.transparent = true;
+    gm.opacity = 0.35;
+    gm.depthWrite = false;
+    this.scene.add(grid);
+    this.mic = new MicGizmo(this.camera, renderer.domElement, this.controls, GROUND_Y);
+    this.mic.min.y = GROUND_Y + 0.05;
+    this.mic.max.y = GROUND_Y + 4;
+    this.mic.onMove = (x, y, z) => this.onMicMove(x, y - GROUND_Y, z);
+    this.scene.add(this.mic.group, this.mic.stand);
 
     new ResizeObserver(() => this.resize()).observe(container);
     this.resize();
@@ -176,7 +247,7 @@ export class EngineView {
     let down: { x: number; y: number } | null = null;
     renderer.domElement.addEventListener('pointerdown', (e) => (down = { x: e.clientX, y: e.clientY }));
     renderer.domElement.addEventListener('pointerup', (e) => {
-      if (down && Math.hypot(e.clientX - down.x, e.clientY - down.y) < 5) this.pick(e);
+      if (down && !this.mic.dragging && Math.hypot(e.clientX - down.x, e.clientY - down.y) < 5) this.pick(e);
       down = null;
     });
   }
@@ -202,7 +273,7 @@ export class EngineView {
   private applyShellStyle(): void {
     for (const m of this.shellMats) {
       m.transparent = !this.cutaway;
-      m.opacity = this.cutaway ? 1 : 0.13;
+      m.opacity = this.cutaway ? 1 : (this.vo.v3Shell ?? 13) / 100;
       m.depthWrite = this.cutaway;
       m.clippingPlanes = this.cutaway ? [this.cutPlane] : [];
       m.needsUpdate = true;
@@ -221,6 +292,116 @@ export class EngineView {
       this.geomSig = sig;
       this.build();
     }
+    this.mic.setPosition(p.micX, GROUND_Y + p.micY, p.micZ);
+    const b = this.placement?.body;
+    const want = p.carBody > 0.5 && b ? JSON.stringify(b) : '';
+    if (want !== this.bodySig) {
+      this.bodySig = want;
+      if (this.body) {
+        this.scene.remove(this.body.group);
+        this.body.group.traverse((o) => {
+          const m = o as THREE.Mesh;
+          if (m.geometry) m.geometry.dispose();
+        });
+        this.body = null;
+      }
+      if (want) this.scene.add((this.body = buildCarBody(b!)).group);
+    }
+    this.refreshOverlay();
+    if (this.body) {
+      this.applyBodyStyle();
+      this.body.bonnet.rotation.x = (p.bonnetOpen / 100) * 60 * DEG;
+      // the glass drops into the door as the window opens
+      for (const w of this.body.windows) w.scale.y = Math.max(0.02, 1 - p.windowsOpen / 100);
+    }
+  }
+
+  /** Display options from the View options panel (see ui/viewOptions.ts). */
+  setViewOptions(v: Record<string, number>): void {
+    this.vo = v;
+    this.grid.visible = v.v3Grid > 0.5;
+    this.controls.autoRotate = v.v3Spin > 0.5;
+    this.controls.autoRotateSpeed = 0.8;
+    if (this.camera.fov !== v.v3Fov) {
+      this.camera.fov = v.v3Fov;
+      this.camera.updateProjectionMatrix();
+    }
+    this.renderer.toneMappingExposure = v.v3Exposure;
+    this.applyShellStyle();
+    this.applyBodyStyle();
+    this.refreshOverlay();
+  }
+
+  private applyBodyStyle(): void {
+    if (!this.body) return;
+    const style = this.vo.v3Body | 0;
+    this.body.group.visible = style !== 2;
+    this.body.group.traverse((o) => {
+      const m = o as THREE.Mesh;
+      // outline only: keep the edge lines, drop the tinted panels
+      if (m.isMesh) (m.material as THREE.Material).visible = style === 0;
+    });
+  }
+
+  private refreshOverlay(): void {
+    const g = this.overlay;
+    g.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (m.geometry) m.geometry.dispose();
+      if (m.material) (m.material as THREE.Material).dispose();
+    });
+    g.clear();
+    const pl = this.placement, p = this.params, v = this.vo;
+    if (!pl || !p) return;
+    const sources: { at: Vec3; color: number }[] = [
+      ...pl.outlets.map((at) => ({ at, color: 0xff7a3c })),
+      { at: pl.mouth, color: 0x4cc2ff },
+      { at: pl.engine, color: 0xffb000 },
+    ];
+    if (v.v3Sources > 0.5) for (const s of sources) {
+      const dot = new THREE.Mesh(new THREE.SphereGeometry(0.035, 16, 12), new THREE.MeshBasicMaterial({ color: s.color, depthTest: false, transparent: true, opacity: 0.9 }));
+      dot.position.set(s.at[0], s.at[1], s.at[2]);
+      dot.renderOrder = 8;
+      g.add(dot);
+    }
+    if (v.v3Paths > 0.5) {
+      const mic = this.mic.group.position;
+      // nearer sources are louder (1/r), so their lines are brighter
+      const nearest = Math.min(...sources.map((s) => Math.hypot(s.at[0] - mic.x, s.at[1] - mic.y, s.at[2] - mic.z)));
+      for (const s of sources) {
+        const r = Math.hypot(s.at[0] - mic.x, s.at[1] - mic.y, s.at[2] - mic.z);
+        const line = new THREE.Line(
+          new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(s.at[0], s.at[1], s.at[2]), mic.clone()]),
+          new THREE.LineBasicMaterial({ color: s.color, transparent: true, opacity: Math.max(0.15, Math.min(1, nearest / r)), depthTest: false }),
+        );
+        line.renderOrder = 7;
+        g.add(line);
+      }
+    }
+    if (v.v3Spaces > 0.5 && p.carBody > 0.5) for (const [box, color] of [[pl.body.bay, 0xffb000], [pl.body.cabin, 0x4cc2ff]] as const) {
+      const geo = new THREE.BoxGeometry(box[3] - box[0], box[4] - box[1], box[5] - box[2]);
+      const m = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.07, depthWrite: false, side: THREE.DoubleSide }));
+      m.position.set(0.5 * (box[0] + box[3]), 0.5 * (box[1] + box[4]), 0.5 * (box[2] + box[5]));
+      m.add(new THREE.LineSegments(new THREE.EdgesGeometry(geo), new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.7 })));
+      g.add(m);
+    }
+  }
+
+  /** Places to put the microphone, for the engine and body as drawn. */
+  micPresets(): MicPreset[] {
+    return this.placement ? micPresets(this.placement) : [];
+  }
+
+  /** Swing the camera out to show the microphone with the engine, and select it. */
+  showMic(): void {
+    const m = this.mic.group.position;
+    const mid = m.clone().multiplyScalar(0.5);
+    const span = Math.max(1.2, m.length());
+    this.controls.target.copy(mid);
+    this.camera.position.copy(mid).add(new THREE.Vector3(0.75, 0.55, -0.6).normalize().multiplyScalar(span * 1.9 + 0.8));
+    this.mic.select(true);
+    this.picked = { object: this.mic.group, local: new THREE.Vector3(0, 0.04, 0), key: 'microphone' };
+    this.onPick(PART_INFO.microphone, 'microphone');
   }
 
   // ------------------------------------------------------------------ build
@@ -240,6 +421,7 @@ export class EngineView {
     this.crank = new THREE.Group();
     this.cyls = [];
     this.pipes = [];
+    this.fireSprites = [];
     this.vols = [];
     this.shellMats = [];
     this.cams = [];
@@ -250,7 +432,8 @@ export class EngineView {
     this.frontDrive = new THREE.Group();
     this.sump = new THREE.Group();
     this.picked = null;
-    this.onPick(null);
+    // a parameter popover changes geometry while it is open: rebuilding must not close it
+    if (!this.holdPick) this.onPick(null);
   }
 
   private build(): void {
@@ -549,6 +732,8 @@ export class EngineView {
       const gas = this.tag(new THREE.Mesh(new THREE.CylinderGeometry(B * 0.485, B * 0.485, 1, 32), gasMat), 'gas');
       gas.renderOrder = 2;
       g.add(gas);
+      const flash = glowSprite(1, 0.78, 0.42);
+      g.add(flash);
 
       // Valves: two intake on the +sgn side, two exhaust on the other.
       const axisIn = new THREE.Vector3(sgn * Math.sin(tilt), Math.cos(tilt), 0);
@@ -661,7 +846,7 @@ export class EngineView {
       }
 
       this.cyls.push({
-        group: g, piston, rod, gas, gasMat, head, shell, valvesIn, valvesEx, lobesIn, lobesEx, seatIn, seatEx, axisIn, axisEx,
+        group: g, flash, glow: 0, piston, rod, gas, gasMat, head, shell, valvesIn, valvesEx, lobesIn, lobesEx, seatIn, seatEx, axisIn, axisEx,
         lobeAngleIn: Math.atan2(-axisIn.y, -axisIn.x), lobeAngleEx: Math.atan2(-axisEx.y, -axisEx.x), arrowIn, arrowEx, fire: layout.fire[i], gearIn, gearEx,
       });
 
@@ -907,6 +1092,11 @@ export class EngineView {
     const topo = buildTopology(p, layout, 1 / 48000);
     const B = this.bore;
     const V = (x: number, y: number, zz: number) => new THREE.Vector3(x, y, zz);
+    // Pipe ends that make sound are drawn exactly where the sound model has them.
+    const pl = (this.placement = place(p, layout, topo));
+    const zShift = 0.5 * (zMin + zMax);
+    const local = (v: Vec3) => V(v[0], v[1], v[2] + zShift);
+    const outletOf = (pipe: number) => local(pl.outlets[topo.pipes.slice(0, pipe).filter((q) => q.radiates).length]);
     const pipeMat = () => new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.5, metalness: 0.25, side: THREE.DoubleSide });
     const addPipe = (index: number, pts: THREE.Vector3[], side: 'intake' | 'exhaust', part: string) => {
       const q = topo.pipes[index];
@@ -935,7 +1125,17 @@ export class EngineView {
       geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
       const mesh = this.tag(new THREE.Mesh(geo, pipeMat()), part);
       engine.add(mesh);
-      this.pipes.push({ mesh, rings, radial, index, home: mesh.position.clone(), side });
+      const centres = new Float32Array((rings + 1) * 3);
+      const at = geo.attributes.position;
+      for (let ring = 0; ring <= rings; ring++) {
+        for (let k = 0; k < radial; k++) {
+          const idx = ring * (radial + 1) + k;
+          centres[ring * 3] += at.getX(idx) / radial;
+          centres[ring * 3 + 1] += at.getY(idx) / radial;
+          centres[ring * 3 + 2] += at.getZ(idx) / radial;
+        }
+      }
+      this.pipes.push({ mesh, centres, diameter: q.diameter, rings, radial, index, home: mesh.position.clone(), side });
     };
     const addVol = (vol: number, mesh: THREE.Mesh, side: 'intake' | 'exhaust', part: string) => {
       this.tag(mesh, part);
@@ -1000,7 +1200,22 @@ export class EngineView {
     addVol(1, plen, 'intake', 'plenum');
     const zFront = zMin - 0.5 * B - plenR;
     const Li = clamp(p.intakeLength * 1e-3, 0.1, 0.8) * 0.8;
-    addPipe(topo.intakePipe, [V(plenC.x, plenC.y, zFront - Li), V(plenC.x, plenC.y, zFront - Li * 0.5), V(plenC.x, plenC.y, zFront + plenR * 0.5)], 'intake', 'intakePipe');
+    const mouth = local(pl.mouth), plenEnd = V(plenC.x, plenC.y, zFront + plenR * 0.5);
+    // With an airbox the mouth is the snorkel's; the intake pipe then starts at the back of the box.
+    let intakeFrom = mouth;
+    const boxVol = topo.volumes.findIndex((x) => x.kind === 'airbox');
+    if (boxVol >= 0) {
+      const side = clamp(Math.cbrt(topo.volumes[boxVol].volume), 0.1, 0.28);
+      const Ls = clamp(p.snorkelLength * 1e-3, 0.05, 0.6) * 0.5;
+      const boxC = mouth.clone().add(V(0, 0, Ls + side / 2));
+      const box = new THREE.Mesh(new THREE.BoxGeometry(side * 1.2, side * 0.8, side), volMat());
+      box.position.copy(boxC);
+      addVol(boxVol, box, 'intake', 'airbox');
+      addPipe(topo.pipes.findIndex((x) => x.kind === 'snorkel'), [mouth, mouth.clone().add(V(0, 0, Ls * 0.5)), mouth.clone().add(V(0, 0, Ls))], 'intake', 'snorkel');
+      intakeFrom = boxC.clone().add(V(0, 0, side / 2));
+    }
+    const boosted = topo.boost.compIn >= 0;
+    if (!boosted) addPipe(topo.intakePipe, [intakeFrom, intakeFrom.clone().lerp(plenEnd, 0.5), plenEnd], 'intake', 'intakePipe');
     const plate = this.tag(new THREE.Mesh(new THREE.CylinderGeometry((p.throttleBody * 1e-3) / 2 * 1.25, (p.throttleBody * 1e-3) / 2 * 1.25, 0.012, 24), new THREE.MeshStandardMaterial({ color: 0xffb000, metalness: 0.6, roughness: 0.4 })), 'throttle');
     plate.rotation.x = Math.PI / 2;
     plate.position.set(plenC.x, plenC.y, zFront + 0.01);
@@ -1014,16 +1229,16 @@ export class EngineView {
     const headerEnd = new Map<number, THREE.Vector3>();
     const junctionPos = new Map<number, THREE.Vector3>();
     const mufflers = topo.volumes.map((v, idx) => ({ v, idx })).filter((x) => x.v.kind === 'muffler');
-    const muffR = 0.085;
+    const muffR = MUFFLER_RADIUS;
     const muffPos = new Map<number, { c: THREE.Vector3; len: number }>();
-    const midLen = clamp(p.midLength * 1e-3, 0.2, 2) * 0.45;
+    const Lt = clamp(p.tailLength * 1e-3, 0.2, 3);
     const collZ = zRear + 0.12 + 0.3 * Lh;
     // room for the merge and the Y-split when one pipe feeds twin mufflers
     const splitDraw = p.rearSplit > 0.5 && (p.collector | 0) < 2 ? 0.45 : 0;
-    mufflers.forEach((m, k) => {
+    mufflers.forEach((m) => {
       const len = clamp(m.v.volume / (Math.PI * muffR * muffR), 0.1, 0.9);
-      const x = mufflers.length > 1 ? (k === 0 ? 0.3 : -0.3) : kind === 'inline' || kind === 'single' ? ports[0].exhaust.x - 0.12 : 0;
-      muffPos.set(m.idx, { c: V(x, lowY - 0.06, collZ + midLen + splitDraw + 0.12 + len / 2), len });
+      const exit = outletOf(topo.pipes.findIndex((x) => x.kind === 'tail' && x.volL === m.idx));
+      muffPos.set(m.idx, { c: V(exit.x, exit.y - 0.02, exit.z - Lt - muffR * 0.5 - len / 2), len });
     });
     const sideX = (i: number) => (kind === 'inline' || kind === 'single' ? ports[i].exhaust.x - 0.14 : ports[i].exhaust.x + Math.sign(ports[i].exhaust.x || 1) * 0.1);
     ports.forEach((q, i) => {
@@ -1034,7 +1249,7 @@ export class EngineView {
       let end: THREE.Vector3;
       const target = topo.volumes[pipe.volR];
       if (target.kind === 'ambient') {
-        end = V(sideX(i), lowY + 0.02 * (i % 3), z[i] + 0.25 + 0.5 * Lh);
+        end = outletOf(k);
       } else if (target.kind === 'junction') {
         if (!junctionPos.has(pipe.volR)) {
           const members = topo.pipes.filter((x) => x.kind === 'header' && x.volR === pipe.volR).map((x) => x.cyl);
@@ -1070,6 +1285,62 @@ export class EngineView {
       j.position.copy(pos);
       addVol(vol, j, 'exhaust', 'collector');
     }
+    if (boosted) {
+      // Turbo: the turbine hangs off the collector with its shaft across the car and the compressor outboard of it.
+      // Supercharger: the compressor alone, low at the front where a belt from the crank would reach it.
+      const turbo = topo.boost.turbIn >= 0;
+      const plain = () => new THREE.MeshStandardMaterial({ color: 0x9aa3ad, metalness: 0.6, roughness: 0.45 });
+      const tube = (pts: THREE.Vector3[], radius: number, part: string) => {
+        const m = this.tag(new THREE.Mesh(new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts, false, 'catmullrom', 0.5), 32, radius, 12), plain()), part);
+        engine.add(m);
+        return m;
+      };
+      // a snail housing: a ring round the shaft with a hub through it
+      const housing = (at: THREE.Vector3, vol: number, part: string, color: number, side: 'intake' | 'exhaust') => {
+        const m = new THREE.Mesh(new THREE.TorusGeometry(0.05, 0.028, 14, 30), new THREE.MeshStandardMaterial({ color, roughness: 0.5, metalness: 0.4 }));
+        m.rotation.y = Math.PI / 2;
+        m.position.copy(at);
+        const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.034, 0.034, 0.05, 20), plain());
+        hub.rotation.x = Math.PI / 2;
+        m.add(hub);
+        addVol(vol, m, side, part);
+      };
+      const outboard = Math.sign(ports[0].exhaust.x || -1);
+      const coll = turbo ? junctionPos.get(topo.boost.turbIn)! : V(0, 0, 0);
+      const tPos = turbo ? coll.clone().add(V(0, 0.015, 0.16)) : V(0, 0, 0);
+      const cPos = turbo ? tPos.clone().add(V(outboard * 0.17, 0, 0)) : V(outboard * 0.22, lowY + 0.02, zFront - 0.1);
+      if (turbo) {
+        housing(tPos, topo.boost.turbOut, 'turbine', 0x8a6a55, 'exhaust');
+        // the neck from the collector into the housing, and the outlet the main pipe starts from
+        tube([coll, coll.clone().lerp(tPos, 0.5).add(V(0, 0.01, 0)), tPos.clone().add(V(0, 0.04, -0.03))], 0.026, 'turbine');
+        const outlet = tPos.clone().add(V(-outboard * 0.05, -0.02, 0.1));
+        tube([tPos.clone().add(V(-outboard * 0.03, 0, 0)), tPos.clone().add(V(-outboard * 0.06, -0.01, 0.04)), outlet], 0.026, 'turbine');
+        junctionPos.set(topo.boost.turbOut, outlet);
+        const shaft = this.tag(new THREE.Mesh(new THREE.CylinderGeometry(0.011, 0.011, 0.17, 12), new THREE.MeshStandardMaterial({ color: 0x9aa3ad, metalness: 0.85, roughness: 0.3 })), 'turboShaft');
+        shaft.rotation.z = Math.PI / 2;
+        shaft.position.copy(tPos).lerp(cPos, 0.5);
+        engine.add(shaft);
+      }
+      housing(cPos, topo.boost.compIn, 'compressor', 0xbfc6cc, turbo ? 'exhaust' : 'intake');
+      // The intercooler stands in for the whole charge volume: low, ahead of everything else on the engine.
+      const icPos = V(0, lowY - 0.07, Math.min(zFront, intakeFrom.z) - 0.2);
+      const ic = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.13, 0.05), volMat());
+      ic.position.copy(icPos);
+      addVol(topo.boost.charge, ic, 'intake', 'intercooler');
+      if (turbo) {
+        // air: from the filter, across the front and down the outside of the exhaust side into the compressor's eye
+        const lane = cPos.x + outboard * 0.16;
+        addPipe(topo.intakePipe, [intakeFrom, V(0.5 * (intakeFrom.x + lane), intakeFrom.y + 0.03, intakeFrom.z + 0.1), V(lane, 0.5 * (intakeFrom.y + cPos.y) + 0.05, zFront + 0.02), V(lane, cPos.y + 0.02, cPos.z - 0.25), V(lane - outboard * 0.03, cPos.y, cPos.z - 0.05), cPos.clone().add(V(outboard * 0.05, 0, 0))], 'intake', 'intakePipe');
+        // compressed air: down from the housing, forward under the manifold to the intercooler
+        tube([cPos.clone().add(V(0, -0.07, 0)), V(cPos.x + outboard * 0.03, lowY - 0.13, cPos.z - 0.12), V(cPos.x + outboard * 0.04, lowY - 0.15, zFront + 0.1), V(icPos.x + outboard * 0.3, icPos.y - 0.02, icPos.z + 0.08), icPos.clone().add(V(outboard * 0.2, 0, 0))], 0.024, 'chargePipe');
+      } else {
+        addPipe(topo.intakePipe, [intakeFrom, V(0.5 * (intakeFrom.x + cPos.x), intakeFrom.y - 0.02, intakeFrom.z + 0.1), V(cPos.x + outboard * 0.12, 0.5 * (intakeFrom.y + cPos.y), cPos.z + 0.02), cPos.clone().add(V(outboard * 0.05, 0, 0))], 'intake', 'intakePipe');
+        tube([cPos.clone().add(V(0, -0.07, 0)), V(cPos.x, icPos.y - 0.02, 0.5 * (cPos.z + icPos.z)), icPos.clone().add(V(outboard * 0.2, 0, 0))], 0.024, 'chargePipe');
+      }
+      // from the other end of the intercooler up to the throttle
+      const icOut = icPos.clone().add(V(-outboard * 0.2, 0, 0));
+      addPipe(topo.pipes.findIndex((x) => x.kind === 'charge'), [icOut, V(icOut.x + (plenEnd.x - icOut.x) * 0.5, icOut.y + 0.03, icOut.z + 0.06), V(plenEnd.x + 0.02, 0.5 * (icOut.y + plenEnd.y), zFront - 0.16), V(plenEnd.x, plenEnd.y - 0.02, zFront - 0.1), plenEnd], 'intake', 'chargePipe');
+    }
     // A catalytic converter sits part-way along the collector pipe, splitting it in two.
     const catPos = new Map<number, THREE.Vector3>();
     const catLen = 0.16, catR = 0.062;
@@ -1098,21 +1369,59 @@ export class EngineView {
       } else if (q.kind === 'tail') {
         const mp = muffPos.get(q.volL)!;
         const a = V(mp.c.x, mp.c.y, mp.c.z + mp.len / 2 + muffR * 0.5);
-        const Lt = clamp(p.tailLength * 1e-3, 0.2, 3) * 0.4;
         addPipe(k, [a, a.clone().add(V(0, 0, Lt * 0.5)), a.clone().add(V(0, 0.02, Lt))], 'exhaust', 'tailpipe');
       }
     });
     for (const [idx, mp] of muffPos) {
-      const m = new THREE.Mesh(new THREE.CapsuleGeometry(muffR, mp.len, 8, 24), volMat());
+      // a deleted muffler is drawn as the length of plain pipe that replaced it
+      const gone = (p.mufflerType | 0) === 3;
+      // the plain pipe has to reach the pipes either side, which stop short for a muffler's rounded ends
+      const m = new THREE.Mesh(new THREE.CapsuleGeometry(gone ? clamp(p.tailDiameter * 0.5e-3, 0.012, 0.06) : muffR, gone ? mp.len + 1.3 * muffR : mp.len, 8, 24), volMat());
       m.rotation.x = Math.PI / 2;
       m.position.copy(mp.c);
-      addVol(idx, m, 'exhaust', 'muffler');
+      addVol(idx, m, 'exhaust', gone ? 'mufflerDelete' : 'muffler');
     }
   }
 
   // ----------------------------------------------------------------- update
 
   /** Pose everything from a snapshot (or a rest pose when there is none) and render. */
+  /** A glow at every exhaust cell where unburned charge is alight. */
+  private drawAfterfire(snap: SnapshotView | null, gain: number, fade: number, lift: number): void {
+    const topo = this.topo;
+    const nc = snap && topo ? snap.nCells : 0;
+    if (this.fireHold.length !== nc) this.fireHold = new Float32Array(nc);
+    const hold = this.fireHold;
+    let any = false;
+    for (let j = 0; j < nc; j++) {
+      const f = Math.max(snap!.cellFire(j), hold[j] * fade);
+      hold[j] = f < 0.01 ? 0 : f;
+      if (hold[j] > 0) any = true;
+    }
+    let used = 0;
+    if (any && gain > 0) {
+      for (const pr of this.pipes) {
+        const info = topo!.pipes[pr.index];
+        if (!info || pr.side !== 'exhaust') continue;
+        const parent = pr.mesh.parent!;
+        for (let cell = 0; cell < info.cells && used < FIRE_POOL; cell++) {
+          const f = hold[info.offset + cell] * gain;
+          if (f < 0.03) continue;
+          let sp = this.fireSprites[used];
+          if (!sp) this.fireSprites[used] = sp = glowSprite(1, 0.5, 0.16);
+          if (sp.parent !== parent) parent.add(sp);
+          const ring = Math.min(pr.rings, Math.round(((cell + 0.5) / info.cells) * pr.rings)) * 3;
+          sp.position.set(pr.home.x + pr.centres[ring], pr.home.y + pr.centres[ring + 1] - 1.2 * lift, pr.home.z + pr.centres[ring + 2]);
+          sp.scale.setScalar(pr.diameter * (4 + 5 * Math.min(1, f)));
+          sp.material.opacity = Math.min(1, f * 1.4);
+          sp.visible = true;
+          used++;
+        }
+      }
+    }
+    for (let k = used; k < this.fireSprites.length; k++) this.fireSprites[k].visible = false;
+  }
+
   render(snap: SnapshotView | null, dt: number): void {
     const p = this.params;
     if (!p || !this.layout) return;
@@ -1154,6 +1463,9 @@ export class EngineView {
       }
     }
 
+    const flashOn = this.vo.v3Flash !== 0;
+    const flashGain = (this.vo.v3FlashGain ?? 100) / 100;
+    const fade = Math.exp(-dt / FLASH_HOLD);
     for (let i = 0; i < n; i++) {
       const c = this.cyls[i];
       let a = live ? snap!.cyl(i, C.angle) : ((-c.fire % 720) + 720) % 720;
@@ -1177,6 +1489,14 @@ export class EngineView {
       c.gasMat.emissive.setRGB(flash * 1.0, flash * 0.72, flash * 0.3);
       c.gasMat.emissiveIntensity = 1 + 3 * flash;
       c.gasMat.opacity = 0.72 + 0.28 * flash;
+      c.glow = Math.max(flash, c.glow * fade);
+      const lit = flashOn ? c.glow * flashGain : 0;
+      c.flash.visible = lit > 0.02 && e < 0.4;
+      if (c.flash.visible) {
+        c.flash.position.set(0, this.deck + this.hc * 0.5 - e * 0.4 * B, 0);
+        c.flash.scale.setScalar(B * (2 + 3 * Math.min(1, lit)));
+        c.flash.material.opacity = Math.min(1, lit * 1.6);
+      }
 
       const li = (live ? snap!.cyl(i, C.liftIn) : 0) * this.liftScale;
       const le = (live ? snap!.cyl(i, C.liftEx) : 0) * this.liftScale;
@@ -1200,6 +1520,8 @@ export class EngineView {
       this.poseArrow(c.arrowEx, me, false);
     }
 
+    this.drawAfterfire(live ? snap! : null, flashOn ? flashGain : 0, fade, e * B);
+
     // Pipes and volumes: colour by gas state.
     const topo = this.topo;
     const mode = this.colorMode;
@@ -1211,10 +1533,16 @@ export class EngineView {
       const col = pr.mesh.geometry.attributes.color as THREE.BufferAttribute;
       const arr = col.array as Float32Array;
       const per = pr.radial + 1;
+      const markCells = this.vo.v3Cells > 0.5;
+      let lastCell = -1;
       for (let ring = 0; ring <= pr.rings; ring++) {
         if (info) {
-          const j = info.offset + Math.min(info.cells - 1, Math.floor((ring / pr.rings) * info.cells));
+          const cell = Math.min(info.cells - 1, Math.floor((ring / pr.rings) * info.cells));
+          const j = info.offset + cell;
           gasColor(mode, PIPE_SCALE, snap!.cellP(j), snap!.cellT(j), snap!.cellY(j), tmpColor);
+          // a dark band where one solver cell meets the next
+          if (markCells && cell !== lastCell && ring > 0) tmpColor[0] = tmpColor[1] = tmpColor[2] = 0.04;
+          lastCell = cell;
         } else gasColor(mode, PIPE_SCALE, P_ATM, T_ATM, 0, tmpColor);
         for (let k = 0; k < per; k++) {
           const o = (ring * per + k) * 3;
@@ -1240,6 +1568,7 @@ export class EngineView {
     }
 
     this.controls.update();
+    this.mic.update();
     this.renderer.render(this.scene, this.camera);
 
     if (this.picked) {
@@ -1263,7 +1592,7 @@ export class EngineView {
 
   private poseArrow(arrow: THREE.Mesh, m: number, intake: boolean): void {
     const mag = Math.min(1.6, Math.abs(m));
-    arrow.visible = mag > 0.03;
+    arrow.visible = mag > 0.03 && this.vo.v3Arrows !== 0;
     if (!arrow.visible) return;
     arrow.scale.setScalar(0.45 + mag);
     // The cone points along +Y at rotation 0; `fwd` aims it along forward flow.
@@ -1272,6 +1601,13 @@ export class EngineView {
   }
 
   private pick(e: PointerEvent): void {
+    if (this.mic.hit(e)) {
+      this.mic.select(true);
+      this.picked = { object: this.mic.group, local: new THREE.Vector3(0, 0.04, 0), key: 'microphone' };
+      this.onPick(PART_INFO.microphone, 'microphone');
+      return;
+    }
+    this.mic.select(false);
     const rect = this.renderer.domElement.getBoundingClientRect();
     const ndc = new THREE.Vector2(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
     this.raycaster.setFromCamera(ndc, this.camera);
@@ -1287,7 +1623,7 @@ export class EngineView {
     }
     const key = hit.object.userData.part as string;
     this.picked = { object: hit.object, local: hit.object.worldToLocal(hit.point.clone()), key };
-    this.onPick(PART_INFO[key] ?? { title: key, text: '' });
+    this.onPick(PART_INFO[key] ?? { title: key, text: '' }, key);
   }
 
   frontView(): void {

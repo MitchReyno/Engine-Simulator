@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { EngineSim } from '../src/sim/engine';
 import { PARAM_DEFS, PRESETS, Params, presetParams } from '../src/sim/params';
+import { C, SnapshotView } from '../src/sim/snapshot';
 import { bandPower, record, spectrum } from './util';
 
 const SR = 48000;
@@ -131,7 +132,12 @@ describe('whole-engine behaviour', () => {
 describe('robustness', () => {
   it('stays finite with every slider at either extreme, at full throttle', () => {
     for (const d of PARAM_DEFS) {
-      if (d.kind !== 'slider' || d.group === 'Audio' || d.key === 'throttle') continue;
+      // the microphone, the car body and the mechanical noise mix cannot disturb the engine; their own tests cover them
+      // sliders that do nothing until their option is on are exercised with it on in tests/intake
+      if (['airboxVolume', 'snorkelLength', 'snorkelDiameter', 'boostTarget', 'turboSize', 'intercooler', 'chargeVolume'].includes(d.key)) continue;
+      // the overrun settings only act with the throttle closed; their own test covers them
+      if (d.key.startsWith('overrun')) continue;
+      if (d.kind !== 'slider' || d.group === 'Audio' || d.group === 'Car body' || d.group === 'Mechanical noise' || d.key === 'throttle') continue;
       for (const v of [d.min, d.max]) {
         const sim = new EngineSim(SR, { ...presetParams('i4'), [d.key]: v });
         sim.run(1.2);
@@ -337,6 +343,59 @@ describe('model fidelity options', () => {
     expect(b.headerWallT).toBeGreaterThan(idleWall + 15);
   });
 
+  it('flash signals for the display: dim at idle, bright at full load, and no afterfire pop is missed', () => {
+    const sim = new EngineSim(SR, { ...presetParams('i4'), fxAfterfire: 1 });
+    const out = new Float32Array(sim.snapshotFloats());
+    const view = new SnapshotView(out);
+    // snapshots 50 ms apart, far longer than a burn or a pop lasts
+    const watch = (seconds: number) => {
+      let cyl = 0, fire = 0;
+      sim.writeSnapshot(out, false); // clears the peaks held since the last read
+      for (let k = 0; k < seconds * 20; k++) {
+        sim.run(0.05);
+        sim.writeSnapshot(out, false);
+        for (let i = 0; i < view.nCyl; i++) cyl = Math.max(cyl, view.cyl(i, C.flash));
+        for (let j = 0; j < view.nCells; j++) if (view.cellFire(j) > 0) fire++;
+      }
+      return { cyl, fire };
+    };
+    sim.run(5);
+    const idle = watch(1);
+    expect(idle.cyl).toBeGreaterThan(0.1);
+    expect(idle.cyl).toBeLessThan(0.8);
+    sim.setParams({ throttle: 100, load: 60 });
+    sim.run(3);
+    const loaded = watch(1);
+    expect(loaded.cyl).toBeGreaterThan(idle.cyl * 1.5);
+    expect(loaded.fire).toBe(0);
+    sim.setParams({ load: 0 });
+    sim.run(2);
+    const pops = sim.gas.pops;
+    const limiter = watch(3);
+    expect(sim.gas.pops).toBeGreaterThan(pops);
+    expect(limiter.fire).toBeGreaterThan(0);
+  });
+
+  it('overrun settings: pops on lift-off only when sparks are skipped with fuel and air to burn', () => {
+    // a heavy flywheel stands in for a car in gear holding the revs up
+    const liftOff = (over: Partial<Params>) => {
+      const sim = new EngineSim(SR, { ...presetParams('k24'), fxAfterfire: 1, flywheel: 1, ...over });
+      sim.run(4);
+      sim.setParams({ throttle: 100, load: 20 });
+      sim.run(5);
+      sim.setParams({ throttle: 0, load: 4 });
+      const before = sim.gas.pops;
+      sim.run(2.5);
+      expect(sim.resets).toBe(0);
+      return sim.gas.pops - before;
+    };
+    const tuned = { overrunCut: 70, overrunRetard: 40, overrunAir: 12 };
+    expect(liftOff({})).toBe(0);
+    expect(liftOff({ fuelCut: 0 })).toBe(0);
+    expect(liftOff({ ...tuned, fuelCut: 1 })).toBe(0);
+    expect(liftOff({ ...tuned, fuelCut: 0 })).toBeGreaterThan(10);
+  });
+
   it('afterfire: separate pops on the limiter, none in normal running, and no roar', () => {
     const sim = new EngineSim(SR, { ...presetParams('i4'), fxAfterfire: 1 });
     const pops = () => sim.gas.pops;
@@ -510,13 +569,13 @@ describe('two-stroke', () => {
     sim.run(4);
     const { x, rpm } = record(sim, N, (s) => s.lastEx);
     const mag = spectrum(x);
-    // Each cylinder has its own pipe and outlet, so the per-cylinder rate rpm / 60 is the base line.
+    // The twin's outlets sit side by side, so its two evenly spaced pulses per turn largely merge into a line at 2 x rpm / 60.
     const rev = rpm / 60;
     let best = 1;
     for (let i = Math.round(20 / BIN); i < 1500 / BIN; i++) if (mag[i] > mag[best]) best = i;
     const ratio = (best * BIN) / rev;
     expect(Math.abs(ratio - Math.round(ratio))).toBeLessThan(0.03);
-    expect(bandPower(mag, rev, BIN) / bandPower(mag, 0.5 * rev, BIN)).toBeGreaterThan(100);
+    expect(bandPower(mag, 2 * rev, BIN) / bandPower(mag, 0.5 * rev, BIN)).toBeGreaterThan(100);
     expect(bandPower(mag, 2 * rev, BIN) / bandPower(mag, 1.5 * rev, BIN)).toBeGreaterThan(100);
     expect(sim.resets).toBe(0);
   });

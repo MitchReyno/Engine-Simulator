@@ -2,6 +2,7 @@
 // usage: PRESET=k24 vite-node scripts/compare-run.ts '{"param":value}' ...
 import { EngineSim, TUNE } from '../src/sim/engine';
 import { presetParams } from '../src/sim/params';
+import { aimMic } from '../tests/util';
 import { ORDERS, OrderFrame, trackOrders } from './orders';
 import { readWav } from './wav';
 
@@ -34,7 +35,10 @@ export function simulated(id: string, extra: Record<string, number>): Row[] {
   extra = { ...extra };
   Object.assign(TUNE, TUNE0);
   for (const k in extra) if (k.startsWith('tune.')) { (TUNE as Record<string, number>)[k.slice(5)] = extra[k]; delete extra[k]; }
-  const sim = new EngineSim(sr, { ...presetParams(id), revLimit: 8300, listenerPos: 3.5, listenerDist: 1, ...extra });
+  const sim = new EngineSim(sr, { ...presetParams(id), revLimit: 8300, ...extra });
+  aimMic(sim, 'tail', 0.4, 0.6);
+  // an explicit microphone position in the variant wins over the default one
+  for (const k of ['micX', 'micY', 'micZ']) if (k in extra) sim.setParams({ [k]: extra[k] });
   sim.run(3);
   sim.setParams({ throttle: 100 });
   const frames: OrderFrame[] = [];
